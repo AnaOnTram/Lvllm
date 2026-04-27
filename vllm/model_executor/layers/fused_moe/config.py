@@ -117,8 +117,10 @@ class RoutingMethodType(IntEnum):
     Custom = (6,)
     # Simulated
     Simulated = (7,)
+    # DeepSeek V4: sqrtsoftplus -> TopK -> Renormalize
+    DeepseekV4 = (8,)
     # Unspecified
-    Unspecified = 8.0
+    Unspecified = 9.0
 
 
 def get_routing_method_type(
@@ -145,6 +147,12 @@ def get_routing_method_type(
             return RoutingMethodType.Renormalize
         else:
             return RoutingMethodType.Default
+
+    if scoring_func == "sqrtsoftplus":
+        if renormalize:
+            return RoutingMethodType.DeepseekV4
+        else:
+            return RoutingMethodType.Unspecified
 
     return RoutingMethodType.Unspecified
 

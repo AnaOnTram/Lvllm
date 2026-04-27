@@ -249,15 +249,33 @@ class FullAttentionSpec(AttentionSpec):
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None
+    # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.
+    alignment: int | None = None
+    compress_ratio: int = 1
+    model_version: str | None = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.alignment is not None:
+            actual_page_size = self.real_page_size_bytes
+            padded_page_size = round_up(actual_page_size, self.alignment)
+            if padded_page_size != actual_page_size:
+                object.__setattr__(self, "page_size_padded", padded_page_size)
+
+    @property
+    def storage_block_size(self) -> int:
+        return self.block_size // self.compress_ratio
 
     @property
     def real_page_size_bytes(self) -> int:
         if self.cache_dtype_str == "fp8_ds_mla":
+            if self.model_version == "deepseek_v4":
+                return self.storage_block_size * 584
             # See `vllm/v1/attention/backends/mla/flashmla_sparse.py`
             #  for details.
             return self.block_size * 656
         return (
-            self.block_size
+            self.storage_block_size
             * self.num_kv_heads
             * self.head_size
             * get_dtype_size(self.dtype)
@@ -269,9 +287,15 @@ class MLAAttentionSpec(FullAttentionSpec):
             "All attention layers in the same KV cache group must be MLAAttentionSpec."
         )
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
-        assert len(cache_dtype_str_set) == 1, (
+        compress_ratio_set = set(spec.compress_ratio for spec in specs)
+        model_version_set = set(spec.model_version for spec in specs)
+        assert (
+            len(cache_dtype_str_set) == 1
+            and len(compress_ratio_set) == 1
+            and len(model_version_set) == 1
+        ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method."
+            "quantization method, compress ratio, and model version."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -281,6 +305,8 @@ class MLAAttentionSpec(FullAttentionSpec):
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
             cache_dtype_str=cache_dtype_str_set.pop(),
+            compress_ratio=compress_ratio_set.pop(),
+            model_version=model_version_set.pop(),
         )
 
 
@@ -327,6 +353,71 @@ class SlidingWindowSpec(AttentionSpec):
         # is 4, we need two blocks [XXCD] [EF] to store the sliding
         # window [CDEF] of 6 tokens.
         return (cdiv(num_tokens, self.block_size) + 1) * self.page_size_bytes
+
+
+@dataclass(frozen=True, kw_only=True)
+class SlidingWindowMLASpec(SlidingWindowSpec):
+    """Sliding window attention with MLA cache format."""
+
+    cache_dtype_str: str | None = None
+    alignment: int | None = None
+    compress_ratio: int = 1
+    model_version: str | None = None
+
+    def __post_init__(self):
+        if self.alignment is not None:
+            actual_page_size = self.real_page_size_bytes
+            padded_page_size = round_up(actual_page_size, self.alignment)
+            if padded_page_size != actual_page_size:
+                object.__setattr__(self, "page_size_padded", padded_page_size)
+
+    @property
+    def storage_block_size(self) -> int:
+        return self.block_size // self.compress_ratio
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.model_version == "deepseek_v4":
+            return self.storage_block_size * 584
+        return (
+            self.storage_block_size
+            * self.num_kv_heads
+            * self.head_size
+            * get_dtype_size(self.dtype)
+        )
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        assert all(isinstance(spec, SlidingWindowMLASpec) for spec in specs), (
+            "All attention layers in the same KV cache group must be "
+            "SlidingWindowMLASpec."
+        )
+        cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        compress_ratio_set = set(spec.compress_ratio for spec in specs)
+        model_version_set = set(spec.model_version for spec in specs)
+        sliding_window_set = set(spec.sliding_window for spec in specs)
+        assert (
+            len(cache_dtype_str_set) == 1
+            and len(compress_ratio_set) == 1
+            and len(model_version_set) == 1
+            and len(sliding_window_set) == 1
+        ), (
+            "All attention layers in the same KV cache group must use the same "
+            "quantization method, compress ratio, model version and sliding "
+            "window."
+        )
+        return cls(
+            block_size=specs[0].block_size,
+            num_kv_heads=specs[0].num_kv_heads,
+            head_size=specs[0].head_size,
+            dtype=specs[0].dtype,
+            kv_quant_mode=specs[0].kv_quant_mode,
+            page_size_padded=specs[0].page_size_padded,
+            sliding_window=sliding_window_set.pop(),
+            cache_dtype_str=cache_dtype_str_set.pop(),
+            compress_ratio=compress_ratio_set.pop(),
+            model_version=model_version_set.pop(),
+        )
 
 
 @dataclass(frozen=True)

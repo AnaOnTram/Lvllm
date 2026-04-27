@@ -86,6 +86,7 @@ _gpu_prefill_lock = threading.Lock()
 def _moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None,
     shared_experts_input: torch.Tensor | None,
     layer_name: _layer_name_type,
 ) -> torch.Tensor:
@@ -99,7 +100,11 @@ def _moe_forward(
                 moe_wait_prefetch(layer, hidden_states, forward_context)
                 layer.ensure_moe_quant_config_init()
                 fused_output = layer.runner.forward_dispatch(
-                    layer, hidden_states, router_logits, shared_experts_input
+                    layer,
+                    hidden_states,
+                    router_logits,
+                    input_ids,
+                    shared_experts_input,
                 )
                 moe_cleanup(layer, layer_name, hidden_states, forward_context)
                 return fused_output
@@ -109,12 +114,20 @@ def _moe_forward(
             logger.debug("GPU prefill busy, fallback to normal path")
             layer.ensure_moe_quant_config_init()
             return layer.runner.forward_dispatch(
-                layer, hidden_states, router_logits, shared_experts_input
+                layer,
+                hidden_states,
+                router_logits,
+                input_ids,
+                shared_experts_input,
             )
     else: 
         layer.ensure_moe_quant_config_init()
         fused_output = layer.runner.forward_dispatch(
-            layer, hidden_states, router_logits, shared_experts_input
+            layer,
+            hidden_states,
+            router_logits,
+            input_ids,
+            shared_experts_input,
         )
     return fused_output
 
@@ -122,6 +135,7 @@ def _moe_forward(
 def _moe_forward_fake(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None,
     shared_experts_input: torch.Tensor | None,
     layer_name: _layer_name_type,
 ) -> torch.Tensor:
@@ -131,6 +145,7 @@ def _moe_forward_fake(
 def _moe_forward_shared(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None,
     shared_experts_input: torch.Tensor | None,
     layer_name: _layer_name_type,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -145,7 +160,11 @@ def _moe_forward_shared(
                 # TODO(bnell): this can be removed after MK migration is complete.
                 layer.ensure_moe_quant_config_init()
                 shared_out, fused_out = layer.runner.forward_dispatch(
-                    layer, hidden_states, router_logits, shared_experts_input
+                    layer,
+                    hidden_states,
+                    router_logits,
+                    input_ids,
+                    shared_experts_input,
                 )
                 moe_cleanup(layer, layer_name, hidden_states, forward_context)
             finally:
@@ -154,13 +173,21 @@ def _moe_forward_shared(
             logger.debug("GPU prefill busy, fallback to normal path")
             layer.ensure_moe_quant_config_init()
             shared_out, fused_out = layer.runner.forward_dispatch(
-                layer, hidden_states, router_logits, shared_experts_input
+                layer,
+                hidden_states,
+                router_logits,
+                input_ids,
+                shared_experts_input,
             )
         
     else:
         layer.ensure_moe_quant_config_init()
         shared_out, fused_out = layer.runner.forward_dispatch(
-            layer, hidden_states, router_logits, shared_experts_input
+            layer,
+            hidden_states,
+            router_logits,
+            input_ids,
+            shared_experts_input,
         )
     return shared_out, fused_out
 
@@ -168,6 +195,7 @@ def _moe_forward_shared(
 def _moe_forward_shared_fake(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None,
     shared_experts_input: torch.Tensor | None,
     layer_name: _layer_name_type,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -471,6 +499,7 @@ class DefaultMoERunner(MoERunner):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
         # Run this before quant_method to avoid inplace issues.
         # TODO(bnell): probably not needed anymore since inplace is
@@ -481,6 +510,7 @@ class DefaultMoERunner(MoERunner):
         topk_weights, topk_ids = self.router.select_experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
+            input_ids=input_ids,
         )
         local_topk_ids = layer.global_to_local_expert_ids(topk_ids) if layer.use_ep else topk_ids
         if self.quant_method.is_monolithic:
@@ -611,6 +641,7 @@ class DefaultMoERunner(MoERunner):
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # For naive dispatch/combine Dp/Ep, dispatch the hidden states and
         # router logits to all experts.
@@ -664,6 +695,7 @@ class DefaultMoERunner(MoERunner):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Invoke the fused moe layer.
 
@@ -707,6 +739,7 @@ class DefaultMoERunner(MoERunner):
         fused_output = self.forward_entry(
             hidden_states,
             router_logits,
+            input_ids,
             shared_experts_input,
             self._encode_layer_name(),
         )
@@ -718,6 +751,7 @@ class DefaultMoERunner(MoERunner):
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # TODO(bnell): this can be removed after MK migration is complete.
@@ -742,6 +776,7 @@ class DefaultMoERunner(MoERunner):
                 layer,
                 hidden_states,
                 router_logits,
+                input_ids,
                 shared_experts_input,
             )
 
@@ -770,6 +805,7 @@ class DefaultMoERunner(MoERunner):
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         final_shared_hidden_states, final_fused_hidden_states = (
@@ -822,12 +858,16 @@ class DefaultMoERunner(MoERunner):
                     if shared_experts_input is not None
                     else None
                 )
+                input_ids_chunk = (
+                    input_ids[chunk_start:chunk_end] if input_ids is not None else None
+                )
 
                 shared_output_chunk, hidden_states_chunk = self._apply_quant_method(
                     layer=layer,
                     hidden_states=hidden_states_chunk,
                     router_logits=router_logits_chunk,
                     shared_experts_input=shared_experts_input_chunk,
+                    input_ids=input_ids_chunk,
                 )
 
                 # Store outputs
@@ -854,6 +894,7 @@ class DefaultMoERunner(MoERunner):
         layer: torch.nn.Module,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # TODO(bnell): parts of the dispatch/combine steps will go away once
@@ -863,6 +904,7 @@ class DefaultMoERunner(MoERunner):
             layer,
             hidden_states,
             router_logits,
+            input_ids=input_ids,
         )
 
         shared_output, hidden_states = self._apply_quant_method(
@@ -870,6 +912,7 @@ class DefaultMoERunner(MoERunner):
             hidden_states=hidden_states,
             router_logits=router_logits,
             shared_experts_input=shared_experts_input,
+            input_ids=input_ids,
         )
 
         return self._maybe_combine(

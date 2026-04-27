@@ -306,3 +306,10 @@ def dispatch_unquantized_gemm() -> Callable[..., torch.Tensor]:
         return cpu_unquantized_gemm
     else:
         return default_unquantized_gemm
+
+
+def cublas_gemm_bf16_bf16_fp32(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+):
+    return ops.router_gemm_bf16_fp32(x, weight)

@@ -291,6 +291,7 @@ class FusedMoE(CustomOp):
         custom_routing_function: Callable | None = None,
         scoring_func: str = "softmax",
         routed_scaling_factor: float = 1.0,
+        swiglu_limit: float | None = None,
         e_score_correction_bias: torch.Tensor | None = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
@@ -305,10 +306,12 @@ class FusedMoE(CustomOp):
         gate: torch.nn.Module | None = None,
         shared_experts: torch.nn.Module | None = None,
         routed_input_transform: torch.nn.Module | None = None,
+        hash_indices_table: torch.Tensor | None = None,
     ):
         super().__init__()
 
         self._routed_input_transform = routed_input_transform
+        self.swiglu_limit = swiglu_limit
 
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
@@ -493,6 +496,7 @@ class FusedMoE(CustomOp):
         self.scoring_func = scoring_func
         self.routed_scaling_factor = routed_scaling_factor
         self.e_score_correction_bias = e_score_correction_bias
+        self.hash_indices_table = hash_indices_table
         # TODO(bnell): end attributes
 
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -517,6 +521,7 @@ class FusedMoE(CustomOp):
             # TODO(bnell): once we can construct the MK at init time, we
             # can make this a value.
             indices_type_getter=lambda: self.quant_method.topk_indices_dtype,
+            hash_indices_table=self.hash_indices_table,
         )
         self.routing_method_type: RoutingMethodType = self.router.routing_method_type
 
@@ -1578,10 +1583,12 @@ class FusedMoE(CustomOp):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self.runner.forward(
             hidden_states,
             router_logits,
+            input_ids,
         )
 
     @property
@@ -1594,8 +1601,9 @@ class FusedMoE(CustomOp):
         self,
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        return self.forward_native(hidden_states, router_logits)
+        return self.forward_native(hidden_states, router_logits, input_ids)
 
     @classmethod
     def make_expert_params_mapping(

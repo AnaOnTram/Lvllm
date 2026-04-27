@@ -220,7 +220,9 @@ class ModelArchConfigConvertorBase:
             "deepseek_v2",
             "deepseek_v3",
             "deepseek_v32",
+            "deepseek_v4",
             "deepseek_mtp",
+            "deepseek_v4_mtp",
             "glm_moe_dsa",
             "glm4_moe_lite",
             "glm4_moe_lite_mtp",
@@ -242,7 +244,9 @@ class ModelArchConfigConvertorBase:
                     "deepseek_v2",
                     "deepseek_v3",
                     "deepseek_v32",
+                    "deepseek_v4",
                     "deepseek_mtp",
+                    "deepseek_v4_mtp",
                 )
                 and getattr(self.hf_text_config, "kv_lora_rank", None) is not None
             )
@@ -475,6 +479,7 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "RefinedWebModel": FalconModelArchConfigConvertor,
     "nemotron-nas": NemotronNasModelArchConfigConvertor,
     "deepseek_mtp": DeepSeekMTPModelArchConfigConvertor,
+    "deepseek_v4_mtp": DeepSeekMTPModelArchConfigConvertor,
     "qwen3_next_mtp": Qwen3NextMTPModelArchConfigConvertor,
     "qwen3_5_mtp": Qwen3_5MTPModelArchConfigConvertor,
     "mimo_mtp": MimoMTPModelArchConfigConvertor,

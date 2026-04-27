@@ -341,6 +341,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_EXT_SRC
     "csrc/quantization/awq/gemm_kernels.cu"
     "csrc/cutlass_extensions/common.cpp"
+    "csrc/fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu"
     "csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu")
 
   set_gencode_flags_for_srcs(
@@ -1024,7 +1025,8 @@ endif()
 set(VLLM_MOE_EXT_SRC
   "csrc/moe/torch_bindings.cpp"
   "csrc/moe/moe_align_sum_kernels.cu"
-  "csrc/moe/topk_softmax_kernels.cu")
+  "csrc/moe/topk_softmax_kernels.cu"
+  "csrc/moe/topk_softplus_sqrt_kernels.cu")
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_MOE_EXT_SRC

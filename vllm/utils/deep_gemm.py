@@ -128,34 +128,46 @@ def _missing(*_: Any, **__: Any) -> NoReturn:
 
 
 _fp8_gemm_nt_impl: Callable[..., Any] | None = None
+_fp8_einsum_impl: Callable[..., Any] | None = None
 _grouped_impl: Callable[..., Any] | None = None
 _grouped_masked_impl: Callable[..., Any] | None = None
+_grouped_fp4_impl: Callable[..., Any] | None = None
 _fp8_mqa_logits_impl: Callable[..., Any] | None = None
 _fp8_paged_mqa_logits_impl: Callable[..., Any] | None = None
 _get_paged_mqa_logits_metadata_impl: Callable[..., Any] | None = None
 _get_mn_major_tma_aligned_tensor_impl: Callable[..., Any] | None = None
 _get_mk_alignment_for_contiguous_layout_impl: Callable[..., Any] | None = None
 _transform_sf_into_required_layout_impl: Callable[..., Any] | None = None
+_tf32_hc_prenorm_gemm_impl: Callable[..., Any] | None = None
 
 
 def _lazy_init() -> None:
     """Import deep_gemm and resolve symbols on first use."""
-    global _fp8_gemm_nt_impl, _grouped_impl, _grouped_masked_impl
+    global \
+        _fp8_gemm_nt_impl, \
+        _fp8_einsum_impl, \
+        _grouped_impl, \
+        _grouped_masked_impl, \
+        _grouped_fp4_impl
     global _fp8_mqa_logits_impl, _fp8_paged_mqa_logits_impl
     global _get_paged_mqa_logits_metadata_impl
     global _get_mn_major_tma_aligned_tensor_impl
     global _get_mk_alignment_for_contiguous_layout_impl
     global _transform_sf_into_required_layout_impl
+    global _tf32_hc_prenorm_gemm_impl
     # fast path
     if (
         _fp8_gemm_nt_impl is not None
+        or _fp8_einsum_impl is not None
         or _grouped_impl is not None
         or _grouped_masked_impl is not None
+        or _grouped_fp4_impl is not None
         or _fp8_mqa_logits_impl is not None
         or _fp8_paged_mqa_logits_impl is not None
         or _get_paged_mqa_logits_metadata_impl is not None
         or _get_mk_alignment_for_contiguous_layout_impl is not None
         or _transform_sf_into_required_layout_impl is not None
+        or _tf32_hc_prenorm_gemm_impl is not None
     ):
         return
 
@@ -172,8 +184,10 @@ def _lazy_init() -> None:
     _dg = importlib.import_module("deep_gemm")
 
     _fp8_gemm_nt_impl = getattr(_dg, "fp8_gemm_nt", None)
+    _fp8_einsum_impl = getattr(_dg, "fp8_einsum", None)
     _grouped_impl = getattr(_dg, "m_grouped_fp8_gemm_nt_contiguous", None)
     _grouped_masked_impl = getattr(_dg, "fp8_m_grouped_gemm_nt_masked", None)
+    _grouped_fp4_impl = getattr(_dg, "m_grouped_fp8_fp4_gemm_nt_contiguous", None)
     _fp8_mqa_logits_impl = getattr(_dg, "fp8_mqa_logits", None)
     _fp8_paged_mqa_logits_impl = getattr(_dg, "fp8_paged_mqa_logits", None)
     _get_paged_mqa_logits_metadata_impl = getattr(
@@ -188,6 +202,7 @@ def _lazy_init() -> None:
     _transform_sf_into_required_layout_impl = getattr(
         _dg, "transform_sf_into_required_layout", None
     )
+    _tf32_hc_prenorm_gemm_impl = getattr(_dg, "tf32_hc_prenorm_gemm", None)
     DeepGemmQuantScaleFMT.init_oracle_cache()
 
 
@@ -232,6 +247,42 @@ def m_grouped_fp8_gemm_nt_contiguous(*args, **kwargs):
         return _missing(*args, **kwargs)
     return _grouped_impl(
         *args, disable_ue8m0_cast=not is_deep_gemm_e8m0_used(), **kwargs
+    )
+
+
+def fp8_einsum(*args, **kwargs):
+    _lazy_init()
+    if _fp8_einsum_impl is None:
+        return _missing(*args, **kwargs)
+    return _fp8_einsum_impl(*args, **kwargs)
+
+
+def m_grouped_fp8_fp4_gemm_nt_contiguous(*args, **kwargs):
+    _lazy_init()
+    if _grouped_fp4_impl is None:
+        return _missing(*args, **kwargs)
+    return _grouped_fp4_impl(
+        *args, disable_ue8m0_cast=not is_deep_gemm_e8m0_used(), **kwargs
+    )
+
+
+def tf32_hc_prenorm_gemm(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    out: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_split: int,
+) -> torch.Tensor:
+    """Run the DeepGEMM TF32 pre-norm helper used by the V4 MHC path."""
+    _lazy_init()
+    if _tf32_hc_prenorm_gemm_impl is None:
+        return _missing()
+    return _tf32_hc_prenorm_gemm_impl(
+        x,
+        fn,
+        out,
+        sqrsum,
+        num_split,
     )
 
 
@@ -449,4 +500,7 @@ __all__ = [
     "should_use_deepgemm_for_fp8_linear",
     "get_col_major_tma_aligned_tensor",
     "get_mk_alignment_for_contiguous_layout",
+    "fp8_einsum",
+    "m_grouped_fp8_fp4_gemm_nt_contiguous",
+    "tf32_hc_prenorm_gemm",
 ]

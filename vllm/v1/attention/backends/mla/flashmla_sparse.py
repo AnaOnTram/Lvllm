@@ -135,6 +135,29 @@ class FlashMLASparseBackend(AttentionBackend):
             return (num_blocks, block_size, head_size)
 
 
+class DeepseekV4FlashMLASparseBackend(FlashMLASparseBackend):
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        return [256]
+
+    @staticmethod
+    def get_name() -> str:
+        return "V4_FLASHMLA_SPARSE"
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if cache_dtype_str == "fp8_ds_mla":
+            # DeepseekV4 main MLA stores 584 bytes per token.
+            return (num_blocks, block_size, 584)
+        return (num_blocks, block_size, head_size)
+
+
 @dataclass
 class FlashMLASparseMetadata(AttentionMetadata):
     num_reqs: int
