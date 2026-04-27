@@ -26,6 +26,121 @@ elif current_platform.is_xpu():
 logger = init_logger(__name__)
 
 
+def _dequantize_indexer_k(
+    k_fp8: torch.Tensor,
+    k_scale_bytes: torch.Tensor,
+) -> torch.Tensor:
+    scales = k_scale_bytes.contiguous().view(torch.float32).reshape(-1, 1)
+    return k_fp8.to(torch.float32) * scales
+
+
+def _weighted_indexer_logits(
+    q_fp8: torch.Tensor,
+    k_dequant: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    logits = torch.einsum("qhd,kd->qhk", q_fp8.to(torch.float32), k_dequant)
+    return (logits * weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)
+
+
+def _topk_per_row_prefill_fallback(
+    logits: torch.Tensor,
+    topk_indices: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk_tokens: int,
+) -> None:
+    topk_indices.fill_(-1)
+    num_rows = logits.shape[0]
+    for row_idx in range(num_rows):
+        row_start = int(cu_seqlen_ks[row_idx].item())
+        row_end = int(cu_seqlen_ke[row_idx].item())
+        valid_len = max(0, row_end - row_start)
+        if valid_len == 0:
+            continue
+        k = min(topk_tokens, valid_len)
+        _, indices = torch.topk(
+            logits[row_idx, row_start:row_end],
+            k=k,
+            dim=-1,
+            largest=True,
+            sorted=False,
+        )
+        topk_indices[row_idx, :k] = indices.to(torch.int32)
+
+
+def _topk_per_row_decode_fallback(
+    q_fp8: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    decode_metadata,
+    topk_indices_buffer: torch.Tensor,
+    head_dim: int,
+    topk_tokens: int,
+) -> None:
+    seq_lens = decode_metadata.seq_lens
+    decode_lens = decode_metadata.decode_lens
+    num_reqs = int(seq_lens.shape[0])
+    total_seq_lens = int(seq_lens.sum().item())
+
+    if total_seq_lens == 0:
+        topk_indices_buffer[: int(decode_lens.sum().item())].fill_(-1)
+        return
+
+    workspace_manager = current_workspace_manager()
+    k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(
+        ((total_seq_lens, head_dim), torch.float8_e4m3fn),
+        ((total_seq_lens, 4), torch.uint8),
+    )
+
+    cu_seq_lens = torch.zeros(
+        num_reqs + 1,
+        dtype=torch.int32,
+        device=seq_lens.device,
+    )
+    cu_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
+    ops.cp_gather_indexer_k_quant_cache(
+        kv_cache,
+        k_fp8_full,
+        k_scale_full,
+        decode_metadata.block_table,
+        cu_seq_lens,
+    )
+    k_dequant_full = _dequantize_indexer_k(k_fp8_full, k_scale_full)
+
+    topk_indices_buffer[: int(decode_lens.sum().item())].fill_(-1)
+    query_start = 0
+    kv_start = 0
+    for req_idx in range(num_reqs):
+        seq_len = int(seq_lens[req_idx].item())
+        decode_len = int(decode_lens[req_idx].item())
+        req_k = k_dequant_full[kv_start : kv_start + seq_len]
+        kv_start += seq_len
+
+        for local_query_idx in range(decode_len):
+            valid_len = seq_len - decode_len + local_query_idx + 1
+            valid_len = max(0, min(valid_len, seq_len))
+            if valid_len == 0:
+                query_start += 1
+                continue
+
+            row_logits = _weighted_indexer_logits(
+                q_fp8[query_start : query_start + 1],
+                req_k[:valid_len],
+                weights[query_start : query_start + 1],
+            )[0]
+            k = min(topk_tokens, valid_len)
+            _, indices = torch.topk(
+                row_logits,
+                k=k,
+                dim=-1,
+                largest=True,
+                sorted=False,
+            )
+            topk_indices_buffer[query_start, :k] = indices.to(torch.int32)
+            query_start += 1
+
+
 def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
@@ -40,6 +155,7 @@ def sparse_attn_indexer(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
+    skip_k_cache_insert: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -82,19 +198,20 @@ def sparse_attn_indexer(
     has_prefill = attn_metadata.num_prefills > 0
     num_decode_tokens = attn_metadata.num_decode_tokens
 
-    # During speculative decoding, k may be padded to the CUDA graph batch
-    # size while slot_mapping only covers actual tokens. Truncate k to avoid
-    # out-of-bounds reads in the kernel.
     num_tokens = slot_mapping.shape[0]
-    k = k[:num_tokens]
 
-    ops.indexer_k_quant_and_cache(
-        k,
-        kv_cache,
-        slot_mapping,
-        quant_block_size,
-        scale_fmt,
-    )
+    if not skip_k_cache_insert:
+        # During speculative decoding, k may be padded to the CUDA graph batch
+        # size while slot_mapping only covers actual tokens. Truncate k to avoid
+        # out-of-bounds reads in the kernel.
+        k = k[:num_tokens]
+        ops.indexer_k_quant_and_cache(
+            k,
+            kv_cache,
+            slot_mapping,
+            quant_block_size,
+            scale_fmt,
+        )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
@@ -120,42 +237,54 @@ def sparse_attn_indexer(
                     chunk.cu_seq_lens,
                 )
 
-            logits = fp8_mqa_logits(
-                q_fp8[chunk.token_start : chunk.token_end],
-                (k_fp8, k_scale.view(torch.float32).flatten()),
-                weights[chunk.token_start : chunk.token_end],
-                chunk.cu_seqlen_ks,
-                chunk.cu_seqlen_ke,
-                clean_logits=False,
-            )
-            num_rows = logits.shape[0]
-
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-
-            if current_platform.is_xpu():
-                ops.top_k_per_row_prefill(
+            if current_platform.is_cuda() and not has_deep_gemm():
+                logits = _weighted_indexer_logits(
+                    q_fp8[chunk.token_start : chunk.token_end],
+                    _dequantize_indexer_k(k_fp8, k_scale),
+                    weights[chunk.token_start : chunk.token_end],
+                )
+                _topk_per_row_prefill_fallback(
                     logits,
+                    topk_indices,
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
                     topk_tokens,
                 )
             else:
-                torch.ops._C.top_k_per_row_prefill(
-                    logits,
+                logits = fp8_mqa_logits(
+                    q_fp8[chunk.token_start : chunk.token_end],
+                    (k_fp8, k_scale.view(torch.float32).flatten()),
+                    weights[chunk.token_start : chunk.token_end],
                     chunk.cu_seqlen_ks,
                     chunk.cu_seqlen_ke,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
+                    clean_logits=False,
                 )
+                num_rows = logits.shape[0]
+                if current_platform.is_xpu():
+                    ops.top_k_per_row_prefill(
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
+                else:
+                    torch.ops._C.top_k_per_row_prefill(
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
 
             # Compute lengths from row spans
             # lengths = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks).to(torch.int32)
@@ -169,93 +298,104 @@ def sparse_attn_indexer(
     if has_decode:
         decode_metadata = attn_metadata.decode
         assert decode_metadata is not None
-        # kv_cache shape [
-        # kv_cache size requirement [num_block, block_size, n_head, head_dim],
-        # we only have [num_block, block_size, head_dim],
-        kv_cache = kv_cache.unsqueeze(-2)
-        decode_lens = decode_metadata.decode_lens
-        if decode_metadata.requires_padding:
-            # pad in edge case where we have short chunked prefill length <
-            # decode_threshold since we unstrictly split
-            # prefill and decode by decode_threshold
-            # (currently set to 1 + speculative tokens)
-            padded_q_fp8_decode_tokens = pack_seq_triton(
-                q_fp8[:num_decode_tokens], decode_lens
+        if current_platform.is_cuda() and not has_deep_gemm():
+            _topk_per_row_decode_fallback(
+                q_fp8[:num_decode_tokens],
+                kv_cache,
+                weights[:num_decode_tokens],
+                decode_metadata,
+                topk_indices_buffer,
+                head_dim,
+                topk_tokens,
             )
         else:
-            padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
-                decode_lens.shape[0], -1, *q_fp8.shape[1:]
-            )
-        # TODO: move and optimize below logic with triton kernels
-        batch_size = padded_q_fp8_decode_tokens.shape[0]
-        next_n = padded_q_fp8_decode_tokens.shape[1]
-        assert batch_size == decode_metadata.seq_lens.shape[0]
-        num_padded_tokens = batch_size * next_n
-        logits = fp8_paged_mqa_logits(
-            padded_q_fp8_decode_tokens,
-            kv_cache,
-            weights[:num_padded_tokens],
-            decode_metadata.seq_lens,
-            decode_metadata.block_table,
-            decode_metadata.schedule_metadata,
-            max_model_len=max_model_len,
-            clean_logits=False,
-        )
-        num_rows = logits.shape[0]
-        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
-
-        if decode_metadata.use_large_context_topk:
-            if next_n == 1:
-                lengths = decode_metadata.seq_lens
-            else:
-                # (bs,) -> (bs, 1) + (next_n,) -> (bs, next_n) -> (bs * next_n,)
-                lengths = (
-                    decode_metadata.seq_lens.unsqueeze(1)
-                    - next_n
-                    + 1
-                    + decode_metadata.offsets
-                ).flatten()
-
-            torch.ops._C.large_context_topk(
-                logits,
-                topk_indices,
-                lengths,
-                None,
-            )
-        else:
-            if current_platform.is_xpu():
-                ops.top_k_per_row_decode(
-                    logits,
-                    next_n,
-                    decode_metadata.seq_lens,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
+            # kv_cache shape [
+            # kv_cache size requirement [num_block, block_size, n_head, head_dim],
+            # we only have [num_block, block_size, head_dim],
+            kv_cache = kv_cache.unsqueeze(-2)
+            decode_lens = decode_metadata.decode_lens
+            if decode_metadata.requires_padding:
+                # pad in edge case where we have short chunked prefill length <
+                # decode_threshold since we unstrictly split
+                # prefill and decode by decode_threshold
+                # (currently set to 1 + speculative tokens)
+                padded_q_fp8_decode_tokens = pack_seq_triton(
+                    q_fp8[:num_decode_tokens], decode_lens
                 )
             else:
-                torch.ops._C.top_k_per_row_decode(
-                    logits,
-                    next_n,
-                    decode_metadata.seq_lens,
-                    topk_indices,
-                    num_rows,
-                    logits.stride(0),
-                    logits.stride(1),
-                    topk_tokens,
+                padded_q_fp8_decode_tokens = q_fp8[:num_decode_tokens].reshape(
+                    decode_lens.shape[0], -1, *q_fp8.shape[1:]
                 )
+            # TODO: move and optimize below logic with triton kernels
+            batch_size = padded_q_fp8_decode_tokens.shape[0]
+            next_n = padded_q_fp8_decode_tokens.shape[1]
+            assert batch_size == decode_metadata.seq_lens.shape[0]
+            num_padded_tokens = batch_size * next_n
+            logits = fp8_paged_mqa_logits(
+                padded_q_fp8_decode_tokens,
+                kv_cache,
+                weights[:num_padded_tokens],
+                decode_metadata.seq_lens,
+                decode_metadata.block_table,
+                decode_metadata.schedule_metadata,
+                max_model_len=max_model_len,
+                clean_logits=False,
+            )
+            num_rows = logits.shape[0]
+            topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        if decode_metadata.requires_padding:
-            # if padded, we need to unpack
-            # the topk indices removing padded tokens
-            topk_indices = unpack_seq_triton(
-                topk_indices.reshape(batch_size, -1, topk_indices.shape[-1]),
-                decode_lens,
-            )
-            topk_indices_buffer[:num_decode_tokens, : topk_indices.shape[-1]] = (
-                topk_indices
-            )
+            if decode_metadata.use_large_context_topk:
+                if next_n == 1:
+                    lengths = decode_metadata.seq_lens
+                else:
+                    # (bs,) -> (bs, 1) + (next_n,) -> (bs, next_n) -> (bs * next_n,)
+                    lengths = (
+                        decode_metadata.seq_lens.unsqueeze(1)
+                        - next_n
+                        + 1
+                        + decode_metadata.offsets
+                    ).flatten()
+
+                torch.ops._C.large_context_topk(
+                    logits,
+                    topk_indices,
+                    lengths,
+                    None,
+                )
+            else:
+                if current_platform.is_xpu():
+                    ops.top_k_per_row_decode(
+                        logits,
+                        next_n,
+                        decode_metadata.seq_lens,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
+                else:
+                    torch.ops._C.top_k_per_row_decode(
+                        logits,
+                        next_n,
+                        decode_metadata.seq_lens,
+                        topk_indices,
+                        num_rows,
+                        logits.stride(0),
+                        logits.stride(1),
+                        topk_tokens,
+                    )
+
+            if decode_metadata.requires_padding:
+                # if padded, we need to unpack
+                # the topk indices removing padded tokens
+                topk_indices = unpack_seq_triton(
+                    topk_indices.reshape(batch_size, -1, topk_indices.shape[-1]),
+                    decode_lens,
+                )
+                topk_indices_buffer[:num_decode_tokens, : topk_indices.shape[-1]] = (
+                    topk_indices
+                )
 
     return topk_indices_buffer
 
@@ -274,6 +414,7 @@ def sparse_attn_indexer_fake(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
+    skip_k_cache_insert: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -310,6 +451,8 @@ class SparseAttnIndexer(CustomOp):
         max_model_len: int,
         max_total_seq_len: int,
         topk_indices_buffer: torch.Tensor,
+        skip_k_cache_insert: bool = False,
+        use_fp4_cache: bool = False,
     ):
         super().__init__()
         self.k_cache = k_cache
@@ -320,9 +463,17 @@ class SparseAttnIndexer(CustomOp):
         self.max_model_len = max_model_len
         self.max_total_seq_len = max_total_seq_len
         self.topk_indices_buffer = topk_indices_buffer
-        if current_platform.is_cuda() and not has_deep_gemm():
+        self.skip_k_cache_insert = skip_k_cache_insert
+        self.use_fp4_cache = use_fp4_cache
+        if current_platform.is_cuda() and not has_deep_gemm() and use_fp4_cache:
             raise RuntimeError(
-                "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
+                "Sparse Attention Indexer CUDA FP4 cache path requires DeepGEMM "
+                "to be installed."
+            )
+        if current_platform.is_cuda() and not has_deep_gemm():
+            logger.warning_once(
+                "DeepGEMM is unavailable; SparseAttnIndexer will use a slower "
+                "PyTorch fallback on CUDA."
             )
 
     def forward_native(
@@ -363,6 +514,7 @@ class SparseAttnIndexer(CustomOp):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            self.skip_k_cache_insert,
         )
 
     def forward_hip(

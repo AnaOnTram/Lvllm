@@ -965,7 +965,9 @@ class DeepseekV4Indexer(nn.Module):
         self.rope_dim = config.qk_rope_head_dim  # 64
         self.q_lora_rank = q_lora_rank  # 1536
         self.compress_ratio = compress_ratio
-        self.use_fp4_kv = self.vllm_config.attention_config.use_fp4_indexer_cache
+        self.use_fp4_kv = getattr(
+            self.vllm_config.attention_config, "use_fp4_indexer_cache", False
+        )
         logger.info_once(
             "Using %s indexer cache for Lighening Indexer.",
             "MXFP4" if self.use_fp4_kv else "FP8",

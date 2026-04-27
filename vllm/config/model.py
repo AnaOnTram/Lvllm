@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import inspect
 import warnings
 from collections.abc import Callable
 from dataclasses import InitVar, field
@@ -101,6 +102,37 @@ _RUNNER_CONVERTS: dict[RunnerType, list[ConvertType]] = {
 AttnTypeStr = Literal[
     "decoder", "encoder", "encoder_only", "encoder_decoder", "attention_free", "hybrid"
 ]
+
+
+def _call_quantization_override(
+    quant_config_cls: type["me_quant.QuantizationConfig"],
+    hf_quant_cfg: dict[str, Any],
+    user_quant: "QuantizationMethods | None",
+    hf_config: PretrainedConfig | None,
+) -> "QuantizationMethods | None":
+    """Call override detection compatibly across old and new signatures.
+
+    Most quantization backends still implement
+    `override_quantization_method(hf_quant_cfg, user_quant)`, while
+    DeepSeek V4 needs optional access to `hf_config`. Probe the signature so
+    we can pass the extra context only when the backend opts in.
+    """
+
+    override_method = quant_config_cls.override_quantization_method
+    parameters = inspect.signature(override_method).parameters.values()
+    accepts_hf_config = any(
+        parameter.kind in (
+            inspect.Parameter.VAR_KEYWORD,
+            inspect.Parameter.VAR_POSITIONAL,
+        )
+        or parameter.name == "hf_config"
+        for parameter in parameters
+    )
+
+    if accepts_hf_config:
+        return override_method(hf_quant_cfg, user_quant, hf_config=hf_config)
+
+    return override_method(hf_quant_cfg, user_quant)
 
 
 @config(config=ConfigDict(arbitrary_types_allowed=True))
@@ -969,8 +1001,11 @@ class ModelConfig:
             # Detect which checkpoint is it
             for name in quantization_methods:
                 method = me_quant.get_quantization_config(name)
-                quantization_override = method.override_quantization_method(
-                    quant_cfg, self.quantization, self.hf_config
+                quantization_override = _call_quantization_override(
+                    method,
+                    quant_cfg,
+                    self.quantization,
+                    self.hf_config,
                 )
                 if quantization_override is not None:
                     # Raise error if the override is not custom (custom would

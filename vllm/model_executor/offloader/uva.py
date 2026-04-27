@@ -86,6 +86,12 @@ class UVAOffloader(BaseOffloader):
                 # one module might have some parameters offloaded and some not
                 break
 
+            # Some parameters may already be backed by pinned CPU memory with a
+            # UVA accelerator view created during module construction. Avoid
+            # offloading and re-counting them a second time here.
+            if getattr(p, "_vllm_is_uva_offloaded", False):
+                continue
+
             if self.cpu_offload_params:
                 # Check if parameter belongs to the offloading set
                 # Add dots here to ensure we match full segments only

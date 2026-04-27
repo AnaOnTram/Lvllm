@@ -32,9 +32,66 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.model_executor.offloader.base import get_offloader
+from vllm.model_executor.offloader.uva import UVAOffloader
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
+from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
 logger = init_logger(__name__)
+
+
+def _matches_offload_segments(param_name: str, offload_params: set[str]) -> bool:
+    return any(f".{segment}." in f".{param_name}." for segment in offload_params)
+
+
+def _allocate_moe_param_data(
+    layer: torch.nn.Module,
+    param_name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, bool]:
+    offloader = get_offloader()
+    full_param_name = f"{getattr(layer, 'layer_name', '')}.{param_name}".strip(".")
+
+    if (
+        isinstance(offloader, UVAOffloader)
+        and offloader.cpu_offload_max_bytes > 0
+        and offloader.cpu_offload_bytes < offloader.cpu_offload_max_bytes
+        and (
+            not offloader.cpu_offload_params
+            or _matches_offload_segments(full_param_name, offloader.cpu_offload_params)
+        )
+    ):
+        cpu_data = torch.zeros(shape, dtype=dtype, device="cpu")
+        if offloader.pin_memory:
+            cpu_data = cpu_data.pin_memory()
+
+        if offloader.uva_offloading:
+            data = get_accelerator_view_from_cpu_tensor(cpu_data)
+            is_uva_offloaded = True
+        else:
+            data = cpu_data
+            is_uva_offloaded = False
+
+        offloader.cpu_offload_bytes += data.numel() * data.element_size()
+        return data, is_uva_offloaded
+
+    return torch.zeros(shape, dtype=dtype), False
+
+
+def _make_moe_parameter(
+    layer: torch.nn.Module,
+    param_name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+) -> torch.nn.Parameter:
+    data, is_uva_offloaded = _allocate_moe_param_data(
+        layer, param_name, shape, dtype
+    )
+    param = torch.nn.Parameter(data, requires_grad=False)
+    if is_uva_offloaded:
+        param._vllm_is_uva_offloaded = True  # type: ignore[attr-defined]
+    return param
 
 
 class Mxfp4Config(QuantizationConfig):
@@ -155,74 +212,74 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.hidden_size = hidden_size
 
         # Fused gate_up_proj (column parallel)
-        w13_weight = torch.nn.Parameter(
-            torch.zeros(
+        w13_weight = _make_moe_parameter(
+            layer,
+            "w13_weight",
+            (
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // 2,
-                dtype=weight_dtype,
             ),
-            requires_grad=False,
+            weight_dtype,
         )
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
-        w13_weight_scale = torch.nn.Parameter(
-            torch.zeros(
+        w13_weight_scale = _make_moe_parameter(
+            layer,
+            "w13_weight_scale",
+            (
                 num_experts,
                 2 * intermediate_size_per_partition,
                 hidden_size // mxfp4_block,
-                dtype=scale_dtype,
             ),
-            requires_grad=False,
+            scale_dtype,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
 
         # down_proj (row parallel)
-        w2_weight = torch.nn.Parameter(
-            torch.zeros(
+        w2_weight = _make_moe_parameter(
+            layer,
+            "w2_weight",
+            (
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // 2,
-                dtype=weight_dtype,
             ),
-            requires_grad=False,
+            weight_dtype,
         )
         layer.register_parameter("w2_weight", w2_weight)
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
-        w2_weight_scale = torch.nn.Parameter(
-            torch.zeros(
+        w2_weight_scale = _make_moe_parameter(
+            layer,
+            "w2_weight_scale",
+            (
                 num_experts,
                 hidden_size,
                 intermediate_size_per_partition // mxfp4_block,
-                dtype=scale_dtype,
             ),
-            requires_grad=False,
+            scale_dtype,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
         if self.moe.has_bias:
-            w13_bias = torch.nn.Parameter(
-                torch.zeros(
-                    num_experts,
-                    2 * intermediate_size_per_partition,
-                    dtype=torch.bfloat16,
-                ),
-                requires_grad=False,
+            w13_bias = _make_moe_parameter(
+                layer,
+                "w13_bias",
+                (num_experts, 2 * intermediate_size_per_partition),
+                torch.bfloat16,
             )
             layer.register_parameter("w13_bias", w13_bias)
             set_weight_attrs(w13_bias, extra_weight_attrs)
 
-            w2_bias = torch.nn.Parameter(
-                torch.zeros(
-                    num_experts,
-                    hidden_size,
-                    dtype=torch.bfloat16,
-                ),
-                requires_grad=False,
+            w2_bias = _make_moe_parameter(
+                layer,
+                "w2_bias",
+                (num_experts, hidden_size),
+                torch.bfloat16,
             )
             layer.register_parameter("w2_bias", w2_bias)
             set_weight_attrs(w2_bias, extra_weight_attrs)

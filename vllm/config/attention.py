@@ -46,6 +46,9 @@ class AttentionConfig:
     use_prefill_query_quantization: bool = False
     """If set, quantize query for attention in prefill."""
 
+    use_fp4_indexer_cache: bool = False
+    """Enable DeepSeek V4 FP4 indexer cache on supported Blackwell datacenter GPUs."""
+
     def compute_hash(self) -> str:
         """
         Provide a hash that uniquely identifies all the configs
