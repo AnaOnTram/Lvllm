@@ -543,3 +543,42 @@ Verification run locally:
 ```
 
 This command passed.
+
+## 2026-04-28 Local Follow-Up: FlashMLA SM120 Kernel Dispatch — SM100 → SM90
+
+After the second `_flashmla_C` rebuild (with the `is_sm100f()` SM120 patch), the
+sparse decode smoke test ran the kernel but failed with:
+
+```text
+CUDA error (/home/ross/DS/Lvllm/.deps/flashmla-src/csrc/sm100/decode/head64/
+instantiations/../kernel.cuh:956): CUDA error: invalid argument
+```
+
+Root cause: `is_sm100f()` returning true for SM120 caused the C++ dispatcher to
+select the SM100 sparse decode kernel path. The SM100 kernels use CUDA
+persistent-cluster launch configurations that SM120 (GB202, consumer Blackwell)
+does not support — `cudaLaunchKernelEx` returns `cudaErrorInvalidValue` when the
+cluster geometry is invalid for the device.
+
+SM120 can run SM90 (Hopper) kernels via PTX forward compatibility. SM90 sparse
+decode kernels use smaller, per-device cluster configurations that SM120 supports.
+The Python metadata already uses the SM90 formula for SM120 (`is_device_capability_family(100)`
+returns False for major==12, so both `max_num_sm_parts` and `prefill_padding` take
+the SM90 branch).
+
+Local patch applied:
+
+- `cmake/external_projects/flashmla.cmake`
+  - Removed the `is_sm100f()` SM120 patch.
+  - Added a new patch: `is_sm90f()` now accepts major `9` or `12`, routing SM120
+    to the SM90 sparse decode kernel path.
+
+Before the next rebuild the already-fetched `common.h` on the remote must be
+reset to its original state, otherwise the new `string(REPLACE ...)` targeting
+`"return major == 9;"` will find no match:
+
+```bash
+cd /home/ross/DS/Lvllm/.deps/flashmla-src
+git checkout csrc/api/common.h
+grep -n "major ==" csrc/api/common.h   # verify is_sm90f says "return major == 9;"
+```

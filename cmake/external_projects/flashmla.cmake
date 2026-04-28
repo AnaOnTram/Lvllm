@@ -30,12 +30,14 @@ endif()
 FetchContent_MakeAvailable(flashmla)
 message(STATUS "FlashMLA is available at ${flashmla_SOURCE_DIR}")
 
-# The upstream FlashMLA runtime dispatcher names the Blackwell sparse decode
-# path `sm100f`, but only accepts CUDA device major 10. GeForce Blackwell
-# devices report major 12 while using the same compiled sparse decode sources.
+# SM120 (consumer Blackwell, e.g. RTX PRO 2000) cannot run the SM100 sparse
+# decode kernels: those kernels request CUDA cluster launch dimensions that
+# SM120 does not support, producing cudaErrorInvalidValue at launch time.
+# SM90 kernels run correctly on SM120 via PTX forward compatibility and use
+# cluster configs that SM120 supports.  Route SM120 to the SM90 kernel path.
 file(READ "${flashmla_SOURCE_DIR}/csrc/api/common.h" FLASHMLA_COMMON_CONTENT)
-string(REPLACE "return major == 10;"
-               "return major == 10 || major == 12;"
+string(REPLACE "return major == 9;"
+               "return major == 9 || major == 12;"
                FLASHMLA_COMMON_CONTENT
                "${FLASHMLA_COMMON_CONTENT}")
 file(WRITE "${flashmla_SOURCE_DIR}/csrc/api/common.h"
