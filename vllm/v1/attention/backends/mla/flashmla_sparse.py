@@ -117,7 +117,10 @@ class FlashMLASparseBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        return capability.major in [9, 10, 12]
+        # SM120 (consumer Blackwell) only has 48 KB shared memory with no opt-in;
+        # FlashMLA kernels require much more. Exclude SM120 so the backend
+        # selector falls through to TRITON_MLA.
+        return capability.major in [9, 10]
 
     @staticmethod
     def get_kv_cache_shape(
