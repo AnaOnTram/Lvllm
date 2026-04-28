@@ -335,3 +335,46 @@ Current `git status --short` also shows other modified files outside the narrow 
 - `vllm/v1/kv_cache_interface.py`
 
 Treat those as existing in-flight changes unless separately reviewed. Do not revert them as part of this handoff.
+
+## 2026-04-28 Local Follow-Up: DeepSeek V4 KV Cache Page Sizes
+
+After the `_moe_C.moe_wna16_marlin_gemm` registration issue was fixed, the
+server progressed through Marlin backend selection, model load, torch compile,
+and warmup, then failed during CUDA graph KV cache profiling:
+
+```text
+NotImplementedError: The page size of the layer is not divisible by the maximum page size. Cannot unify by adjusting block_size.
+```
+
+The failure is in `vllm/v1/core/kv_cache_utils.py` while unifying hybrid KV cache
+page sizes. DeepSeek V4 creates several cache specs with different aligned page
+sizes, including main MLA/SWA cache pages, C128 compressed pages, indexer cache
+pages, and compressor state pages. These are not clean integer multiples of the
+largest page, so the existing compact hybrid allocator cannot normalize them by
+only increasing `block_size`.
+
+Local-only patch applied:
+
+- `vllm/v1/core/kv_cache_utils.py`
+  - Fall back to heterogeneous per-layer KV tensor allocation when page sizes
+    are not divisible.
+  - Account for heterogeneous page sizes in block-count and max-memory
+    estimates.
+- `vllm/v1/worker/gpu_model_runner.py`
+  - Reshape MLA-family caches using compressed storage block sizes.
+  - Use `torch.as_strided` for padded cache pages so alignment padding does not
+    have to appear in the logical backend cache shape.
+
+Verification run locally:
+
+```bash
+.venv/bin/python -m py_compile \
+  vllm/v1/core/kv_cache_utils.py \
+  vllm/v1/worker/gpu_model_runner.py
+
+git diff --check -- \
+  vllm/v1/core/kv_cache_utils.py \
+  vllm/v1/worker/gpu_model_runner.py
+```
+
+Both commands passed. This has not been synced to `192.168.1.16`.

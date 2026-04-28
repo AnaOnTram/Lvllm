@@ -140,6 +140,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheSpec,
     MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -6620,9 +6622,23 @@ class GPUModelRunner(
                     )
                     kernel_num_blocks = num_blocks * num_blocks_per_kv_block
 
+                    storage_kernel_block_size = kernel_block_size
+                    if isinstance(
+                        kv_cache_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
+                    ):
+                        storage_kernel_block_size = (
+                            kernel_block_size // kv_cache_spec.compress_ratio
+                        )
+
                     kv_cache_shape = attn_backend.get_kv_cache_shape(
                         kernel_num_blocks,
-                        kernel_block_size,
+                        storage_kernel_block_size,
+                        kv_cache_spec.num_kv_heads,
+                        kv_cache_spec.head_size,
+                        cache_dtype_str=self.cache_config.cache_dtype,
+                    )
+                    block_dim = attn_backend.get_kv_cache_block_dim(
+                        storage_kernel_block_size,
                         kv_cache_spec.num_kv_heads,
                         kv_cache_spec.head_size,
                         cache_dtype_str=self.cache_config.cache_dtype,
@@ -6646,12 +6662,43 @@ class GPUModelRunner(
                         kv_cache_stride_order.index(i)
                         for i in range(len(kv_cache_stride_order))
                     ]
-                    kv_caches[layer_name] = (
-                        kv_cache_raw_tensors[layer_name]
-                        .view(dtype)
-                        .view(kv_cache_shape)
-                        .permute(*inv_order)
-                    )
+                    dtype_view = kv_cache_raw_tensors[layer_name].view(dtype)
+                    dense_numel = 1
+                    for dim in kv_cache_shape:
+                        dense_numel *= dim
+                    if dtype_view.numel() == dense_numel:
+                        kv_cache = dtype_view.view(kv_cache_shape)
+                    else:
+                        dtype_size = get_dtype_size(dtype)
+                        assert kv_cache_spec.page_size_bytes % dtype_size == 0
+                        page_size_el = kv_cache_spec.page_size_bytes // dtype_size
+                        dense_page_el = dense_numel // num_blocks
+                        if num_blocks_per_kv_block != 1:
+                            raise NotImplementedError(
+                                "Padded KV cache pages with virtual block "
+                                "splitting are not supported."
+                            )
+                        assert dense_page_el <= page_size_el, (
+                            "KV cache view is larger than the allocated page."
+                        )
+                        strides = [1] * len(kv_cache_shape)
+                        for i in range(len(kv_cache_shape) - 2, -1, -1):
+                            strides[i] = strides[i + 1] * kv_cache_shape[i + 1]
+                        physical_block_dim = kv_cache_stride_order.index(block_dim)
+                        dense_block_stride = strides[physical_block_dim]
+                        for i, stride in enumerate(strides):
+                            if stride > dense_block_stride:
+                                assert stride % dense_block_stride == 0
+                                strides[i] = (
+                                    stride // dense_block_stride
+                                ) * page_size_el
+                        strides[physical_block_dim] = page_size_el
+                        kv_cache = torch.as_strided(
+                            dtype_view,
+                            size=kv_cache_shape,
+                            stride=tuple(strides),
+                        )
+                    kv_caches[layer_name] = kv_cache.permute(*inv_order)
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
