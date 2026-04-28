@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe import (
     FusedMoEConfig,
     FusedMoEMethodBase,
 )
+from vllm.model_executor.layers.fused_moe.layer import FusedMoeWeightScaleSupported
 from vllm.model_executor.layers.fused_moe import modular_kernel as mk
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEParallelConfig,
@@ -236,7 +237,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             scale_dtype,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
-        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w13_weight_scale, {
+            **extra_weight_attrs,
+            "quant_method": FusedMoeWeightScaleSupported.BLOCK.value,
+        })
 
         # down_proj (row parallel)
         w2_weight = _make_moe_parameter(
@@ -263,7 +267,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             scale_dtype,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, {
+            **extra_weight_attrs,
+            "quant_method": FusedMoeWeightScaleSupported.BLOCK.value,
+        })
 
         if self.moe.has_bias:
             w13_bias = _make_moe_parameter(

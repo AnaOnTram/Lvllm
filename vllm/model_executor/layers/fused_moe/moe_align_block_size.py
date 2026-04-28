@@ -8,6 +8,115 @@ from vllm.triton_utils import triton
 from vllm.utils.math_utils import round_up
 
 
+def _has_moe_align_block_size_op() -> bool:
+    return hasattr(torch.ops._moe_C, "moe_align_block_size")
+
+
+def _has_batched_moe_align_block_size_op() -> bool:
+    return hasattr(torch.ops._moe_C, "batched_moe_align_block_size")
+
+
+def _fill_with_sentinel(tensor: torch.Tensor, value: int) -> None:
+    tensor.fill_(value)
+
+
+def _moe_align_block_size_fallback(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: torch.Tensor | None,
+    pad_sorted_ids: bool,
+    ignore_invalid_experts: bool,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+) -> None:
+    flat_topk_ids = topk_ids.reshape(-1).to(torch.int64)
+    flat_token_ids = torch.arange(
+        flat_topk_ids.numel(), dtype=torch.int32, device=topk_ids.device
+    )
+    invalid_token_id = flat_topk_ids.numel()
+
+    _fill_with_sentinel(sorted_ids, invalid_token_id)
+    _fill_with_sentinel(expert_ids, -1)
+
+    if expert_map is not None and ignore_invalid_experts:
+        valid_mask = expert_map[flat_topk_ids] != -1
+    else:
+        valid_mask = None
+
+    sorted_cursor = 0
+    expert_cursor = 0
+    for expert_idx in range(num_experts):
+        expert_mask = flat_topk_ids == expert_idx
+        if valid_mask is not None:
+            expert_mask &= valid_mask
+
+        token_ids = flat_token_ids[expert_mask]
+        num_tokens = token_ids.numel()
+        if num_tokens == 0:
+            continue
+
+        num_tokens_padded = round_up(num_tokens, block_size)
+        next_sorted_cursor = sorted_cursor + num_tokens_padded
+        sorted_ids[sorted_cursor : sorted_cursor + num_tokens] = token_ids
+        sorted_cursor = next_sorted_cursor
+
+        num_blocks = num_tokens_padded // block_size
+        expert_ids[expert_cursor : expert_cursor + num_blocks] = expert_idx
+        expert_cursor += num_blocks
+
+    if pad_sorted_ids:
+        sorted_cursor = round_up(sorted_cursor, block_size)
+
+    num_tokens_post_pad[0] = sorted_cursor
+
+    if expert_map is not None and not ignore_invalid_experts:
+        valid_blocks = expert_ids != -1
+        expert_ids[valid_blocks] = expert_map[expert_ids[valid_blocks].to(torch.int64)]
+
+
+def _batched_moe_align_block_size_fallback(
+    max_tokens_per_batch: int,
+    block_size: int,
+    expert_num_tokens: torch.Tensor,
+    sorted_ids: torch.Tensor,
+    expert_ids: torch.Tensor,
+    num_tokens_post_pad: torch.Tensor,
+) -> None:
+    num_batches = expert_num_tokens.size(0)
+    invalid_token_id = num_batches * max_tokens_per_batch
+
+    _fill_with_sentinel(sorted_ids, invalid_token_id)
+    _fill_with_sentinel(expert_ids, -1)
+
+    sorted_cursor = 0
+    expert_cursor = 0
+    for batch_idx, num_valid_tokens in enumerate(expert_num_tokens.tolist()):
+        if num_valid_tokens < 0:
+            raise ValueError("expert_num_tokens must be non-negative")
+        if num_valid_tokens == 0:
+            continue
+
+        batch_start = batch_idx * max_tokens_per_batch
+        token_ids = torch.arange(
+            batch_start,
+            batch_start + num_valid_tokens,
+            dtype=torch.int32,
+            device=expert_num_tokens.device,
+        )
+        num_tokens_padded = round_up(num_valid_tokens, block_size)
+        next_sorted_cursor = sorted_cursor + num_tokens_padded
+        sorted_ids[sorted_cursor : sorted_cursor + num_valid_tokens] = token_ids
+        sorted_cursor = next_sorted_cursor
+
+        num_blocks = num_tokens_padded // block_size
+        expert_ids[expert_cursor : expert_cursor + num_blocks] = batch_idx
+        expert_cursor += num_blocks
+
+    num_tokens_post_pad[0] = sorted_cursor
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -87,18 +196,31 @@ def moe_align_block_size(
     )
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
-    ops.moe_align_block_size(
-        topk_ids,
-        num_experts,
-        block_size,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        expert_map if ignore_invalid_experts else None,
-    )
+    if _has_moe_align_block_size_op():
+        ops.moe_align_block_size(
+            topk_ids,
+            num_experts,
+            block_size,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            expert_map if ignore_invalid_experts else None,
+        )
 
-    if expert_map is not None and not ignore_invalid_experts:
-        expert_ids = expert_map[expert_ids]
+        if expert_map is not None and not ignore_invalid_experts:
+            expert_ids = expert_map[expert_ids]
+    else:
+        _moe_align_block_size_fallback(
+            topk_ids=topk_ids,
+            block_size=block_size,
+            num_experts=num_experts,
+            expert_map=expert_map,
+            pad_sorted_ids=pad_sorted_ids,
+            ignore_invalid_experts=ignore_invalid_experts,
+            sorted_ids=sorted_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_pad=num_tokens_post_pad,
+        )
 
     return sorted_ids, expert_ids, num_tokens_post_pad
 
@@ -180,13 +302,23 @@ def batched_moe_align_block_size(
     expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=device)
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=device)
 
-    ops.batched_moe_align_block_size(
-        max_tokens_per_batch,
-        block_size,
-        expert_num_tokens,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-    )
+    if _has_batched_moe_align_block_size_op():
+        ops.batched_moe_align_block_size(
+            max_tokens_per_batch,
+            block_size,
+            expert_num_tokens,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+        )
+    else:
+        _batched_moe_align_block_size_fallback(
+            max_tokens_per_batch=max_tokens_per_batch,
+            block_size=block_size,
+            expert_num_tokens=expert_num_tokens,
+            sorted_ids=sorted_ids,
+            expert_ids=expert_ids,
+            num_tokens_post_pad=num_tokens_post_pad,
+        )
 
     return sorted_ids, expert_ids, num_tokens_post_pad

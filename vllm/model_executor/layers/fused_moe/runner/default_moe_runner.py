@@ -513,8 +513,13 @@ class DefaultMoERunner(MoERunner):
             input_ids=input_ids,
         )
         local_topk_ids = layer.global_to_local_expert_ids(topk_ids) if layer.use_ep else topk_ids
+        use_lk_moe = (
+            getattr(layer, "lk_moe", None) is not None
+            and not layer.is_gpu_resident_layer
+            and not layer.should_use_gpu_prefill(hidden_states)
+        )
         if self.quant_method.is_monolithic:
-            if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
+            if use_lk_moe:
                 fused_out = layer.forward_lk( 
                     hidden_states,
                     topk_weights, 
@@ -540,7 +545,7 @@ class DefaultMoERunner(MoERunner):
                         router_logits=router_logits,
                     )
         else:
-            if not layer.is_gpu_resident_layer and not layer.should_use_gpu_prefill(hidden_states):
+            if use_lk_moe:
                 fused_out = layer.forward_lk(
                     hidden_states,
                     topk_weights, 
@@ -927,9 +932,16 @@ from typing import Dict, Optional, List
 from vllm.envs import extract_layer_index  
  
 
-def create_cpu_weights(layer, is_fp8: bool, is_wna16: bool, is_regular: bool) -> Dict[str, torch.Tensor]: 
+def create_cpu_weights(
+    layer,
+    is_fp8: bool = False,
+    is_wna16: bool = False,
+    is_regular: bool = False,
+    is_mxfp4: bool = False,
+) -> Dict[str, torch.Tensor]:
     pin_memory = is_pin_memory_available()
     cpu_weights = {}
+    is_regular_like = is_regular or is_mxfp4
     
     if is_fp8 or is_wna16: 
         param_names = ["w13_weight", "w2_weight"]
@@ -957,7 +969,7 @@ def create_cpu_weights(layer, is_fp8: bool, is_wna16: bool, is_regular: bool) ->
             cpu_weights[param_name] = weight_cpu
             logger.debug(f"Created {param_name} with shape {shape} for FP8/WNA16 layer")
             
-    elif is_regular: 
+    elif is_regular_like: 
         w13_shape = (layer.local_num_experts, 
                     layer.intermediate_size_per_partition * 2 if layer.has_gate_proj else layer.intermediate_size_per_partition,    
                     layer.hidden_size)
@@ -998,6 +1010,7 @@ def moe_prepare_gpu_prefill(layer, forward_context: ForwardContext, device: torc
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MarlinMoEMethod
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MoEMethod  
     from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod  
+    from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
     from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoEMethod
     from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
     if layer.is_gpu_prefill_layer: 
@@ -1051,7 +1064,26 @@ def moe_prepare_gpu_prefill(layer, forward_context: ForwardContext, device: torc
                 ] 
                 
                 if is_temporary:
-                    cpu_weights = create_cpu_weights(layer)
+                    cpu_weights = create_cpu_weights(
+                        layer,
+                        is_fp8=isinstance(layer.quant_method, Fp8MoEMethod)
+                        or isinstance(
+                            layer.quant_method,
+                            CompressedTensorsW8A8Fp8MoEMethod,
+                        ),
+                        is_wna16=isinstance(
+                            layer.quant_method,
+                            CompressedTensorsWNA16MarlinMoEMethod,
+                        )
+                        or isinstance(
+                            layer.quant_method,
+                            CompressedTensorsWNA16MoEMethod,
+                        ),
+                        is_regular=isinstance(
+                            layer.quant_method, UnquantizedFusedMoEMethod
+                        ),
+                        is_mxfp4=isinstance(layer.quant_method, Mxfp4MoEMethod),
+                    )
                 else:
                     cpu_weights = {}
                  
@@ -1066,7 +1098,9 @@ def moe_prepare_gpu_prefill(layer, forward_context: ForwardContext, device: torc
                     
                     is_fp8 =  isinstance(layer.quant_method, Fp8MoEMethod) or isinstance(layer.quant_method, CompressedTensorsW8A8Fp8MoEMethod)
                     is_wna16 = (isinstance(layer.quant_method, CompressedTensorsWNA16MarlinMoEMethod) or isinstance(layer.quant_method, CompressedTensorsWNA16MoEMethod))
-                    is_regular = isinstance(layer.quant_method, UnquantizedFusedMoEMethod)
+                    is_regular = isinstance(
+                        layer.quant_method, UnquantizedFusedMoEMethod
+                    ) or isinstance(layer.quant_method, Mxfp4MoEMethod)
                     if is_fp8 or is_wna16:
                         if param_name == "w13_weight":
                             E = layer.local_num_experts

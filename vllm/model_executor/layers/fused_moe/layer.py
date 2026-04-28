@@ -377,6 +377,8 @@ class FusedMoE(CustomOp):
         self.is_gpu_resident_layer = is_lk_moe_gpu_resident_layer(self.layer_name) 
         self.is_gpu_prefill_layer = is_lk_moe_gpu_prefill_layer(self.layer_name)
         self.is_cpu_layer = is_lk_moe_cpu_layer(self.layer_name)
+        self.lk_moe = None
+        self.lk_moe_config = None
         self._lk_moe_guard = LkMoeSerialGuard()
         if get_gpu_prefill_min_batch_size() > vllm_config.scheduler_config.max_num_batched_tokens:
             logger.error(
@@ -1745,14 +1747,17 @@ class FusedMoE(CustomOp):
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MarlinMoEMethod
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MoEMethod  
             from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod  
+            from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoEMethod
             from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod 
             is_regular = isinstance(self.quant_method, UnquantizedFusedMoEMethod)
             is_fp8 =  isinstance(self.quant_method, Fp8MoEMethod) or isinstance(self.quant_method, CompressedTensorsW8A8Fp8MoEMethod)
             is_wna16 = (isinstance(self.quant_method, CompressedTensorsWNA16MarlinMoEMethod) or isinstance(self.quant_method, CompressedTensorsWNA16MoEMethod))
+            is_mxfp4 = isinstance(self.quant_method, Mxfp4MoEMethod)
+            is_regular_like = is_regular or is_mxfp4
             
             
-            max_placeholder = 3 if is_regular else 2 if is_fp8 else 1 if is_wna16 else 0
+            max_placeholder = 3 if is_regular_like else 2 if is_fp8 else 1 if is_wna16 else 0
             if not hasattr(FusedMoE, '_max_placeholder'):
                 FusedMoE._max_placeholder = max_placeholder
                 placeholder_create_or_replace_need = True
@@ -1783,7 +1788,13 @@ class FusedMoE(CustomOp):
                 param_names = ["w13_weight", "w2_weight"]
                 
                 for batch_id in range(batch_size):
-                    FusedMoE._cpu_weights_placeholder[batch_id] = create_cpu_weights(self, is_fp8, is_wna16, is_regular) 
+                    FusedMoE._cpu_weights_placeholder[batch_id] = create_cpu_weights(
+                        self,
+                        is_fp8,
+                        is_wna16,
+                        is_regular,
+                        is_mxfp4,
+                    )
                     FusedMoE._gpu_weights_placeholder[batch_id] = {}
                     for param_name in param_names:
                         FusedMoE._gpu_weights_placeholder[batch_id][param_name] = torch.zeros_like(FusedMoE._cpu_weights_placeholder[batch_id][param_name], device=torch.cuda.current_device())
@@ -1795,6 +1806,7 @@ class FusedMoE(CustomOp):
             from vllm.model_executor.layers.quantization.awq_marlin import AWQMarlinMoEMethod
             from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
             from vllm.model_executor.layers.quantization.gguf import GGUFMoEMethod
+            from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
             from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoEMethod
             from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4FusedMoE
             find_weight = False  
@@ -1828,6 +1840,11 @@ class FusedMoE(CustomOp):
                     else:
                         self._process_channel_weights_quant(strategy)
                     find_weight = True
+                if isinstance(self.quant_method, Mxfp4MoEMethod):
+                    if self._process_mxfp4_weights():
+                        find_weight = True
+                    else:
+                        return
                 if isinstance(self.quant_method, UnquantizedFusedMoEMethod): 
                     self._process_regular_weights()
                     find_weight = True
@@ -1846,6 +1863,7 @@ class FusedMoE(CustomOp):
             
     def clean_weights_after_loading(self):
         from vllm.model_executor.layers.quantization.fp8 import Fp8MoEMethod
+        from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
         from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsW8A8Fp8MoEMethod
         from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MarlinMoEMethod
         from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors_moe import CompressedTensorsWNA16MoEMethod 
@@ -1890,6 +1908,23 @@ class FusedMoE(CustomOp):
                                 torch.empty(0, device=torch.cuda.current_device()), 
                                 requires_grad=False
                             ))
+
+                if (
+                    isinstance(self.quant_method, Mxfp4MoEMethod)
+                    and self.lk_moe is not None
+                ):
+                    param_names = [
+                        "w13_weight",
+                        "w2_weight",
+                        "w13_weight_scale",
+                        "w2_weight_scale",
+                    ]
+                    for param_name in param_names:
+                        if hasattr(self, param_name):
+                            setattr(self, param_name, torch.nn.Parameter(
+                                torch.empty(0, device=torch.cuda.current_device()),
+                                requires_grad=False
+                            ))
                                 
                 if (isinstance(self.quant_method, CompressedTensorsWNA16MarlinMoEMethod) or isinstance(self.quant_method, CompressedTensorsWNA16MoEMethod)):
                     param_names = [
@@ -1928,6 +1963,73 @@ class FusedMoE(CustomOp):
                 return 30  # GGML_TYPE_BF16
             else:
                 raise ValueError(f"Unsupported dtype {dtype}")
+
+    def _dequantize_mxfp4_weight(
+        self,
+        packed_weight: torch.Tensor,
+        packed_scales: torch.Tensor,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import break_fp4_bytes
+
+        block_size = 32
+        packed_k = packed_weight.shape[-1]
+        full_k = packed_k * 2
+        num_blocks = full_k // block_size
+
+        assert packed_scales.shape == (*packed_weight.shape[:-1], num_blocks), (
+            f"Packed scales shape {packed_scales.shape} must match "
+            f"{(*packed_weight.shape[:-1], num_blocks)}"
+        )
+
+        flat_weight = break_fp4_bytes(
+            packed_weight.reshape(-1, packed_k), torch.float32
+        )
+        flat_weight = flat_weight.view(-1, num_blocks, block_size)
+
+        descale = torch.exp2(
+            packed_scales.reshape(-1, num_blocks).to(torch.float32) - 127.0
+        )
+        dequantized = flat_weight * descale.unsqueeze(-1)
+
+        return dequantized.view(*packed_weight.shape[:-1], full_k).to(output_dtype)
+
+    def _estimate_mxfp4_lk_dense_bytes(self) -> int:
+        elem_size = torch.empty((), dtype=self.moe_config.in_dtype).element_size()
+
+        w13_shape = self.w13_weight.shape
+        w2_shape = self.w2_weight.shape
+
+        dense_w13_elems = w13_shape[0] * w13_shape[1] * (w13_shape[2] * 2)
+        dense_w2_elems = w2_shape[0] * w2_shape[1] * (w2_shape[2] * 2)
+
+        return (dense_w13_elems + dense_w2_elems) * elem_size
+
+    def _can_materialize_mxfp4_lk(self, dense_bytes: int) -> bool:
+        import psutil
+
+        gib = 1024**3
+        reserve_bytes = 8 * gib
+        # MXFP4 currently needs to be expanded into dense weights before the
+        # lk_moe bindings can consume it. Account for the dense resident copy
+        # plus temporary tensors created during that conversion.
+        estimated_peak_bytes = dense_bytes * 3
+        available_bytes = psutil.virtual_memory().available
+
+        if available_bytes < estimated_peak_bytes + reserve_bytes:
+            logger.warning(
+                "Skipping lk_moe init for MXFP4 layer %s: dense weights need "
+                "%.2f GiB and init peak is estimated at %.2f GiB, but only "
+                "%.2f GiB host RAM is currently available. Falling back to "
+                "the default MXFP4 MoE path.",
+                self.layer_name,
+                dense_bytes / gib,
+                estimated_peak_bytes / gib,
+                available_bytes / gib,
+            )
+            return False
+
+        return True
     
     def _get_processes_info(self) -> tuple[int, int, int]: 
         if self.use_ep:
@@ -2166,6 +2268,119 @@ class FusedMoE(CustomOp):
           
         del w13_weight_ptr, w2_weight_ptr, w13_weight_scale_ptr, w2_weight_scale_ptr
         del w13_weight, w2_weight, w13_weight_scale, w2_weight_scale
+        
+
+    def _process_mxfp4_weights(self) -> bool:
+        from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+        if not isinstance(self.quant_method, Mxfp4MoEMethod):
+            raise TypeError(
+                f"_process_mxfp4_weights requires Mxfp4MoEMethod, got {type(self.quant_method)}"
+            )
+
+        w13_weight = self.w13_weight
+        w2_weight = self.w2_weight
+        w13_weight_scale = self.w13_weight_scale
+        w2_weight_scale = self.w2_weight_scale
+
+        hidden_ggml_type = self.get_ggml_type_from_dtype(self.moe_config.in_dtype)
+        w13_ggml_type = hidden_ggml_type
+        w2_ggml_type = hidden_ggml_type
+
+        E, N, packed_K = w13_weight.shape
+        K = packed_K * 2
+        w2_packed_N = self.intermediate_size_per_partition // 2
+        assert w2_weight.shape == (E, K, w2_packed_N), (
+            f"Down weight shape {w2_weight.shape} must be ({E}, {K}, {w2_packed_N})"
+        )
+        assert w13_weight_scale.shape == (E, N, K // 32), (
+            f"Up weight scale shape {w13_weight_scale.shape} must be "
+            f"({E}, {N}, {K // 32})"
+        )
+        assert w2_weight_scale.shape == (
+            E,
+            K,
+            self.intermediate_size_per_partition // 32,
+        ), (
+            f"Down weight scale shape {w2_weight_scale.shape} must be "
+            f"({E}, {K}, {self.intermediate_size_per_partition // 32})"
+        )
+
+        dense_bytes = self._estimate_mxfp4_lk_dense_bytes()
+        if not self._can_materialize_mxfp4_lk(dense_bytes):
+            self.lk_moe = None
+            self.lk_moe_config = None
+            return False
+
+        if is_lk_moe_quant_on_gpu():
+            dequant_device = torch.cuda.current_device()
+        else:
+            dequant_device = torch.device("cpu")
+
+        w13_projs = []
+        w2_projs = []
+
+        for expert_idx in range(E):
+            expert_w13_weight = w13_weight[expert_idx].to(device=dequant_device)
+            expert_w13_scale = w13_weight_scale[expert_idx].to(device=dequant_device)
+            expert_w2_weight = w2_weight[expert_idx].to(device=dequant_device)
+            expert_w2_scale = w2_weight_scale[expert_idx].to(device=dequant_device)
+
+            w13_dequant = self._dequantize_mxfp4_weight(
+                expert_w13_weight,
+                expert_w13_scale,
+                self.moe_config.in_dtype,
+            )
+            w2_dequant = self._dequantize_mxfp4_weight(
+                expert_w2_weight,
+                expert_w2_scale,
+                self.moe_config.in_dtype,
+            )
+
+            w13_projs.append(w13_dequant.cpu())
+            w2_projs.append(w2_dequant.cpu())
+
+            del expert_w13_weight, expert_w13_scale, expert_w2_weight, expert_w2_scale
+            del w13_dequant, w2_dequant
+
+        w13_tensor = torch.stack(w13_projs, dim=0)
+        w2_tensor = torch.stack(w2_projs, dim=0)
+
+        w13_projs.clear()
+        w2_projs.clear()
+        del w13_projs, w2_projs
+
+        w13_ptr = w13_tensor.contiguous().data_ptr()
+        w2_ptr = w2_tensor.contiguous().data_ptr()
+
+        num_processes, process_id, gpu_id = self._get_processes_info()
+
+        self.lk_moe_config = lk_moe.MOEConfig(
+            num_processes,
+            process_id,
+            gpu_id,
+            self.has_gate_proj,
+            self.local_num_experts,
+            self.top_k,
+            self.hidden_size,
+            self.intermediate_size_per_partition,
+            32,
+            10,
+            self.max_num_group_batch_size,
+            hidden_ggml_type,
+            w13_ggml_type,
+            w2_ggml_type,
+            w13_ptr,
+            w2_ptr,
+        )
+        self.lk_moe = lk_moe.MOE(self.lk_moe_config)
+
+        del w13_ptr, w2_ptr
+        del w13_tensor, w2_tensor
+
+        import gc
+        gc.collect()
+        return True
         
 
    

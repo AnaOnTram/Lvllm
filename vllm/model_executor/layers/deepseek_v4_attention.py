@@ -16,7 +16,7 @@ from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
 )
 from vllm.model_executor.layers.sparse_attn_indexer import SparseAttnIndexer
-from vllm.utils.deep_gemm import fp8_einsum
+from vllm.utils.deep_gemm import fp8_einsum, is_deep_gemm_supported
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.deepseek_v4_ops import (
     combine_topk_swa_indices,
@@ -50,6 +50,7 @@ from vllm.model_executor.layers.quantization.input_quant_fp8 import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
+    get_and_maybe_dequant_weights,
 )
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.v1.attention.backend import AttentionBackend
@@ -76,6 +77,40 @@ logger = init_logger(__name__)
 # workspace allocated at _forward_prefill (and the matching profile-time
 # reservation in attention_impl's dummy-run branch).
 PREFILL_CHUNK_SIZE = 4
+
+
+def _inverse_rope_o_proj_input(
+    o: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    n_groups: int,
+    heads_per_group: int,
+    nope_dim: int,
+    rope_dim: int,
+) -> torch.Tensor:
+    """Apply the DeepSeek V4 inverse-RoPE used before the wo_a projection."""
+
+    num_tokens, num_heads, head_dim = o.shape
+    assert num_heads == n_groups * heads_per_group
+    assert head_dim == nope_dim + rope_dim
+    assert rope_dim % 2 == 0
+
+    o_grouped = o.view(num_tokens, n_groups, heads_per_group, head_dim)
+    o_nope = o_grouped[..., :nope_dim]
+    o_rope = o_grouped[..., nope_dim:].to(torch.float32)
+
+    cos_sin = cos_sin_cache.index_select(0, positions.to(torch.long))
+    cos = cos_sin[:, : rope_dim // 2].view(num_tokens, 1, 1, rope_dim // 2)
+    sin = cos_sin[:, rope_dim // 2 :].view(num_tokens, 1, 1, rope_dim // 2)
+
+    even = o_rope[..., 0::2]
+    odd = o_rope[..., 1::2]
+    inv_rope = torch.empty_like(o_rope)
+    inv_rope[..., 0::2] = even * cos + odd * sin
+    inv_rope[..., 1::2] = odd * cos - even * sin
+
+    o_inv = torch.cat((o_nope, inv_rope.to(o.dtype)), dim=-1)
+    return o_inv.reshape(num_tokens, n_groups, heads_per_group * head_dim)
 
 
 @dataclass
@@ -198,6 +233,16 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         cap = current_platform.get_device_capability()
         self._einsum_recipe = (1, 128, 128) if cap.major <= 9 else (1, 1, 128)
         self._tma_aligned_scales = cap.major >= 10
+        self._use_deep_gemm = is_deep_gemm_supported()
+        if not self._use_deep_gemm:
+            wo_a_weight = get_and_maybe_dequant_weights(
+                self.wo_a, out_dtype=torch.bfloat16
+            )
+            self.register_buffer(
+                "_wo_a_weight_bf16",
+                wo_a_weight.view(self.n_local_groups, self.o_lora_rank, -1),
+                persistent=False,
+            )
 
         self.rotary_emb = mla_modules.rotary_emb
         self.indexer_rotary_emb = mla_modules.indexer_rotary_emb
@@ -298,35 +343,51 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
         o = o_padded[:, : self.n_local_heads, :]
 
-        # O projection: inverse RoPE + FP8 quant + einsum + wo_b
-        o_fp8, o_scale = fused_inv_rope_fp8_quant(
-            o,
-            positions,
-            self.rotary_emb.cos_sin_cache,
-            n_groups=self.n_local_groups,
-            heads_per_group=self.n_local_heads // self.n_local_groups,
-            nope_dim=self.nope_head_dim,
-            rope_dim=self.rope_head_dim,
-            tma_aligned_scales=self._tma_aligned_scales,
-        )
+        if self._use_deep_gemm:
+            # O projection: inverse RoPE + FP8 quant + einsum + wo_b
+            o_fp8, o_scale = fused_inv_rope_fp8_quant(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+                tma_aligned_scales=self._tma_aligned_scales,
+            )
 
-        wo_a_fp8 = self.wo_a.weight
-        wo_a_scale = self.wo_a.weight_scale_inv
+            wo_a_fp8 = self.wo_a.weight
+            wo_a_scale = self.wo_a.weight_scale_inv
 
-        z = torch.empty(
-            (num_tokens, self.n_local_groups, self.o_lora_rank),
-            device=o.device,
-            dtype=torch.bfloat16,
-        )
-        torch.ops.vllm.deepseek_v4_fp8_einsum(
-            o_fp8,
-            o_scale,
-            wo_a_fp8,
-            wo_a_scale,
-            z,
-            "bhr,hdr->bhd",
-            list(self._einsum_recipe),
-        )
+            z = torch.empty(
+                (num_tokens, self.n_local_groups, self.o_lora_rank),
+                device=o.device,
+                dtype=torch.bfloat16,
+            )
+            torch.ops.vllm.deepseek_v4_fp8_einsum(
+                o_fp8,
+                o_scale,
+                wo_a_fp8,
+                wo_a_scale,
+                z,
+                "bhr,hdr->bhd",
+                list(self._einsum_recipe),
+            )
+        else:
+            o_inv = _inverse_rope_o_proj_input(
+                o,
+                positions,
+                self.rotary_emb.cos_sin_cache,
+                n_groups=self.n_local_groups,
+                heads_per_group=self.n_local_heads // self.n_local_groups,
+                nope_dim=self.nope_head_dim,
+                rope_dim=self.rope_head_dim,
+            )
+            z = torch.einsum(
+                "bgi,gri->bgr",
+                o_inv.to(self._wo_a_weight_bf16.dtype),
+                self._wo_a_weight_bf16,
+            )
 
         return self.wo_b(z.flatten(1))
 

@@ -2186,7 +2186,10 @@ def wvSplitKQ(
 
 # moe
 def moe_sum(input: torch.Tensor, output: torch.Tensor):
-    torch.ops._moe_C.moe_sum(input, output)
+    if hasattr(torch.ops._moe_C, "moe_sum"):
+        torch.ops._moe_C.moe_sum(input, output)
+    else:
+        output.copy_(input.sum(dim=1))
 
 
 def moe_align_block_size(
@@ -2459,6 +2462,15 @@ def moe_wna16_marlin_gemm(
     thread_n: int = -1,
     blocks_per_sm: int = -1,
 ) -> torch.Tensor:
+    if not hasattr(torch.ops, "_moe_C") or not hasattr(
+        torch.ops._moe_C, "moe_wna16_marlin_gemm"
+    ):
+        raise RuntimeError(
+            "Missing custom op _moe_C.moe_wna16_marlin_gemm. "
+            "The installed vLLM CUDA _moe_C extension is incomplete or stale; "
+            "rebuild vLLM in this environment with CUDA MoE Marlin support."
+        )
+
     return torch.ops._moe_C.moe_wna16_marlin_gemm(
         input,
         output,

@@ -17,6 +17,12 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
 
 
+def _has_topk_softplus_sqrt_op() -> bool:
+    return hasattr(torch.ops, "_moe_C") and hasattr(
+        torch.ops._moe_C, "topk_softplus_sqrt"
+    )
+
+
 def vllm_topk_softmax(
     topk_weights: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -152,7 +158,7 @@ def fused_topk_bias(
             if routed_scaling_factor != 1.0:
                 topk_weights *= routed_scaling_factor
             return topk_weights, topk_ids
-        elif scoring_func == "sqrtsoftplus":
+        elif scoring_func == "sqrtsoftplus" and _has_topk_softplus_sqrt_op():
             return vllm_topk_softplus_sqrt(
                 topk_weights,
                 topk_ids,
@@ -164,7 +170,7 @@ def fused_topk_bias(
                 hash_indices_table,
                 routed_scaling_factor,
             )
-        else:
+        elif scoring_func not in {"sqrtsoftplus"}:
             raise ValueError(f"Unsupported scoring function: {scoring_func}")
     elif rocm_aiter_ops.is_fused_moe_enabled() and scoring_func == "sigmoid":
         M = hidden_states.size(0)

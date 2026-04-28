@@ -17,9 +17,9 @@ void topk_softplus_sqrt(torch::Tensor& topk_weights,
                         torch::Tensor& token_expert_indices,
                         torch::Tensor& gating_output, bool renormalize,
                         double routed_scaling_factor,
-                        std::optional<torch::Tensor> bias,
-                        std::optional<torch::Tensor> input_ids,
-                        std::optional<torch::Tensor> tid2eid);
+                        const std::optional<torch::Tensor>& bias,
+                        const std::optional<torch::Tensor>& input_ids,
+                        const std::optional<torch::Tensor>& tid2eid);
 
 void moe_sum(torch::Tensor& input, torch::Tensor& output);
 

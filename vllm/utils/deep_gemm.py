@@ -250,10 +250,57 @@ def m_grouped_fp8_gemm_nt_contiguous(*args, **kwargs):
     )
 
 
+def _fp8_einsum_pytorch_fallback(
+    equation: str,
+    a_pair: tuple[torch.Tensor, torch.Tensor],
+    b_pair: tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    recipe: tuple[int, ...] | None = None,
+) -> None:
+    """Pure-PyTorch fallback for fp8_einsum when DeepGEMM is unavailable.
+
+    Handles both FP32 block scales (SM90 / Hopper) and packed UE8M0 INT32
+    scales (SM100 / Blackwell).  For UE8M0: each int32 holds 4 uint8 bytes
+    where byte i (little-endian) encodes scale_i = 2^(byte_i - 127).
+    """
+
+    def _dequantize(tensor: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        t_f32 = tensor.to(torch.float32)
+
+        if scale.dtype == torch.int32:
+            # Packed UE8M0 (SM100): 4 UE8M0 bytes per int32, little-endian.
+            # byte e  →  float 2^(e - 127)
+            scale_u8 = scale.contiguous().view(torch.uint8)
+            scale_f32 = torch.exp2(scale_u8.to(torch.float32) - 127.0)
+        else:
+            scale_f32 = scale.to(torch.float32)
+
+        # Reshape scale dims to match tensor if they differ (e.g. 2-D scale
+        # against a 3-D tensor when the weight uses a flat G*L layout).
+        if scale_f32.dim() != t_f32.dim():
+            scale_f32 = scale_f32.reshape(*t_f32.shape[: t_f32.dim() - 1], -1)
+
+        # Expand blocks in the last (contraction) dimension.
+        block_size = t_f32.shape[-1] // scale_f32.shape[-1]
+        if block_size > 1:
+            scale_f32 = scale_f32.repeat_interleave(block_size, dim=-1)
+
+        return t_f32 * scale_f32
+
+    a, a_scale = a_pair
+    b, b_scale = b_pair
+    a_dq = _dequantize(a, a_scale)
+    b_dq = _dequantize(b, b_scale)
+    out.copy_(torch.einsum(equation, a_dq, b_dq).to(out.dtype))
+
+
 def fp8_einsum(*args, **kwargs):
     _lazy_init()
     if _fp8_einsum_impl is None:
-        return _missing(*args, **kwargs)
+        # DeepGEMM not available — fall back to a pure-PyTorch implementation.
+        equation, a_pair, b_pair, out = args[0], args[1], args[2], args[3]
+        recipe = kwargs.get("recipe", None)
+        return _fp8_einsum_pytorch_fallback(equation, a_pair, b_pair, out, recipe)
     return _fp8_einsum_impl(*args, **kwargs)
 
 
@@ -276,7 +323,15 @@ def tf32_hc_prenorm_gemm(
     """Run the DeepGEMM TF32 pre-norm helper used by the V4 MHC path."""
     _lazy_init()
     if _tf32_hc_prenorm_gemm_impl is None:
-        return _missing()
+        # PyTorch fallback for GPUs without deep_gemm support.
+        # fn: [hc_mult3, hc_hidden_size]; x: [T, hc_hidden_size]
+        # out: [n_splits, T, hc_mult3]; sqrsum: [n_splits, T]
+        x_f32 = x.to(torch.float32)
+        out.zero_()
+        sqrsum.zero_()
+        out[0] = x_f32 @ fn.T
+        sqrsum[0] = (x_f32 * x_f32).sum(dim=-1)
+        return
     return _tf32_hc_prenorm_gemm_impl(
         x,
         fn,

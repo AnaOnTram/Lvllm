@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
 from enum import Enum
 from typing import Union
 
@@ -73,6 +74,25 @@ TRITON_BACKENDS = (
     Mxfp4MoeBackend.TRITON,
     Mxfp4MoeBackend.TRITON_UNFUSED,
 )
+
+
+def _has_moe_wna16_marlin_gemm() -> bool:
+    with contextlib.suppress(ImportError):
+        import vllm._moe_C  # noqa: F401
+
+    return hasattr(torch.ops, "_moe_C") and hasattr(
+        torch.ops._moe_C, "moe_wna16_marlin_gemm"
+    )
+
+
+def _missing_backend_required_op(backend: Mxfp4MoeBackend) -> str | None:
+    if backend in (Mxfp4MoeBackend.MARLIN, Mxfp4MoeBackend.BATCHED_MARLIN):
+        if not _has_moe_wna16_marlin_gemm():
+            return (
+                "required custom op _moe_C.moe_wna16_marlin_gemm is missing. "
+                "Rebuild the vLLM CUDA _moe_C extension for this environment."
+            )
+    return None
 
 
 def backend_to_kernel_cls(
@@ -249,6 +269,10 @@ def select_mxfp4_moe_backend(
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts]]:
+        missing_op_reason = _missing_backend_required_op(backend)
+        if missing_op_reason is not None:
+            raise ValueError(_make_log_unsupported(backend, missing_op_reason))
+
         reason: str | None = None
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(
@@ -344,6 +368,14 @@ def select_mxfp4_moe_backend(
 
     for backend in AVAILABLE_BACKENDS:
         activation_key = _backend_activation_key(backend)
+        missing_op_reason = _missing_backend_required_op(backend)
+        if missing_op_reason is not None:
+            logger.debug_once(
+                _make_log_unsupported(backend, missing_op_reason),
+                scope="local",
+            )
+            continue
+
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(
                 k_cls, config, kMxfp4Static, activation_key, activation_format

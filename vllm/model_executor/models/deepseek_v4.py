@@ -925,12 +925,13 @@ class DeepseekV4Attention(nn.Module):
         rope_parameters["mscale_all_dim"] = 0  # Disable mscale
         rope_parameters["is_deepseek_v4"] = True
         rope_parameters["rope_dim"] = self.rope_head_dim
+        rope_parameters["partial_rotary_factor"] = self.rope_head_dim / self.head_dim
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=self.max_position_embeddings,
             rope_parameters=rope_parameters,
             is_neox_style=False,
-            dtype=config.torch_dtype,
+            dtype=torch.float32,
         )
 
         self.indexer = None
