@@ -30,7 +30,7 @@ else:
     _flashmla_extension_C_AVAILABLE = False
 
 
-def _is_flashmla_available() -> tuple[bool, str | None]:
+def _is_flashmla_sparse_available() -> tuple[bool, str | None]:
     if not _flashmla_C_AVAILABLE:
         return (
             False,
@@ -38,6 +38,13 @@ def _is_flashmla_available() -> tuple[bool, str | None]:
             "compiled due to insufficient nvcc version or a supported arch "
             "was not in the list of target arches to compile for.",
         )
+    return True, None
+
+
+def _is_flashmla_available() -> tuple[bool, str | None]:
+    is_available, maybe_reason = _is_flashmla_sparse_available()
+    if not is_available:
+        return False, maybe_reason
     if not _flashmla_extension_C_AVAILABLE:
         return (
             False,
@@ -64,12 +71,13 @@ def is_flashmla_sparse_supported() -> tuple[bool, str | None]:
     """
     Return: is_supported_flag, unsupported_reason (optional).
     """
-    is_available, maybe_reason = _is_flashmla_available()
+    is_available, maybe_reason = _is_flashmla_sparse_available()
     if not is_available:
         return False, maybe_reason
     if not (
         current_platform.is_device_capability_family(90)
         or current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability_family(120)
     ):
         return (
             False,
@@ -79,11 +87,11 @@ def is_flashmla_sparse_supported() -> tuple[bool, str | None]:
 
 
 def _raise_flashmla_unavailable(*_args, **_kwargs):
-    _, reason = _is_flashmla_available()
+    _, reason = _is_flashmla_sparse_available()
     raise RuntimeError(reason or "FlashMLA is not available")
 
 
-if _is_flashmla_available()[0]:
+if _is_flashmla_sparse_available()[0]:
     from vllm.third_party.flashmla.flash_mla_interface import (  # noqa: F401
         FlashMLASchedMeta,
         flash_attn_varlen_func,

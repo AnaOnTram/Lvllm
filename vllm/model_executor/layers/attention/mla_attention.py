@@ -1373,13 +1373,23 @@ class MLADims:
 
 def get_mla_dims(model_config: ModelConfig) -> MLADims:
     hf_text_config = model_config.hf_text_config
+    kv_lora_rank = getattr(
+        hf_text_config,
+        "kv_lora_rank",
+        getattr(hf_text_config, "head_dim"),
+    )
+    qk_rope_head_dim = hf_text_config.qk_rope_head_dim
 
     return MLADims(
         q_lora_rank=getattr(hf_text_config, "q_lora_rank", None),
-        kv_lora_rank=hf_text_config.kv_lora_rank,
-        qk_nope_head_dim=hf_text_config.qk_nope_head_dim,
-        qk_rope_head_dim=hf_text_config.qk_rope_head_dim,
-        v_head_dim=hf_text_config.v_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        qk_nope_head_dim=getattr(
+            hf_text_config,
+            "qk_nope_head_dim",
+            kv_lora_rank - qk_rope_head_dim,
+        ),
+        qk_rope_head_dim=qk_rope_head_dim,
+        v_head_dim=getattr(hf_text_config, "v_head_dim", kv_lora_rank),
     )
 
 

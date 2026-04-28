@@ -378,3 +378,168 @@ git diff --check -- \
 ```
 
 Both commands passed. This has not been synced to `192.168.1.16`.
+
+## 2026-04-28 Local Follow-Up: DeepSeek V4 MLA Dimension Fields
+
+After the heterogeneous KV cache fallback was synced, startup progressed past
+the KV page-size unification error and failed while constructing FlashMLA sparse
+metadata:
+
+```text
+AttributeError: 'DeepseekV4Config' object has no attribute 'kv_lora_rank'. Did you mean: 'o_lora_rank'?
+```
+
+`get_mla_dims()` was assuming older MLA config field names. DeepSeek V4 stores
+the equivalent latent KV width as `head_dim`, and the DeepSeek V4 attention
+wrapper already passes `kv_lora_rank=self.head_dim`.
+
+Local patch applied:
+
+- `vllm/model_executor/layers/attention/mla_attention.py`
+  - `get_mla_dims()` now falls back to `head_dim` when `kv_lora_rank` is absent.
+  - `qk_nope_head_dim` is derived as `kv_lora_rank - qk_rope_head_dim` when the
+    explicit field is absent.
+  - `v_head_dim` falls back to `kv_lora_rank` when absent.
+
+Verification run locally:
+
+```bash
+.venv/bin/python -m py_compile \
+  vllm/model_executor/layers/attention/mla_attention.py
+```
+
+This command passed.
+
+## 2026-04-28 Local Follow-Up: Experimental SM120 FlashMLA Port
+
+After the CPU-offload profiling patch was synced, startup reached CUDA graph
+memory profiling and then failed while building DeepSeek V4 sparse MLA metadata:
+
+```text
+RuntimeError: vllm._flashmla_C is not available, likely was not compiled due to insufficient nvcc version or a supported arch was not in the list of target arches to compile for.
+```
+
+The target server reports an RTX PRO 2000 Blackwell GPU with compute capability
+`(12, 0)`. The existing FlashMLA build gate only listed Hopper `9.0a` and
+SM10x Blackwell targets (`10.0a` / `10.0f`), while other vLLM kernels already
+list SM12x targets.
+
+Local experimental port applied:
+
+- `cmake/external_projects/flashmla.cmake`
+  - Added SM12x FlashMLA target arches: `12.0f` for CUDA 13+ and
+    `12.0a` / `12.1a` for CUDA 12.8+.
+- `vllm/v1/attention/ops/flashmla.py`
+  - Split sparse availability from dense-extension availability so sparse
+    FlashMLA only requires `_flashmla_C`.
+  - Allowed SM120-family devices through `is_flashmla_sparse_supported()`.
+- `vllm/v1/attention/backends/mla/flashmla_sparse.py`
+  - Allowed compute-capability major `12` for the FlashMLA sparse backend.
+- `vllm/platforms/cuda.py`
+  - Treat MLA on major `12` similarly to major `10` for backend priority order.
+
+Local verification run:
+
+```bash
+.venv/bin/python -m py_compile \
+  vllm/v1/attention/ops/flashmla.py \
+  vllm/v1/attention/backends/mla/flashmla_sparse.py \
+  vllm/platforms/cuda.py
+```
+
+This command passed. The next required verification is a remote rebuild with
+`CUDA_HOME=/usr/local/cuda-12.9` and `/usr/local/cuda-12.9/bin` on `PATH`; the
+FlashMLA source may still need deeper SM120 kernel changes if the upstream
+SM100 instantiations do not compile or run for SM120.
+
+## 2026-04-28 Local Follow-Up: FlashMLA SM120 Runtime Dispatch
+
+After rebuilding FlashMLA on the Blackwell host, both extension modules imported
+cleanly, but a real sparse decode smoke test failed with:
+
+```text
+RuntimeError: Unsupported architecture for sparse decode fwd
+```
+
+Root cause: upstream FlashMLA's `csrc/api/common.h` reports `Arch::is_sm100f()`
+only when CUDA device major is `10`. RTX PRO 2000 Blackwell reports compute
+capability `12.0`, so it passed the vLLM Python/CMake gates but was rejected by
+FlashMLA's C++ sparse decode dispatcher before launching the SM100 sparse
+decode kernels.
+
+Local patch applied:
+
+- `cmake/external_projects/flashmla.cmake`
+  - Patches the fetched FlashMLA `csrc/api/common.h` during CMake configure so
+    `is_sm100f()` accepts major `12` as well as major `10`.
+
+The next verification is rebuilding `_flashmla_C` on the server and rerunning
+the sparse decode smoke test.
+
+## 2026-04-28 Handoff: Remote Rebuild In Progress
+
+The SM120 runtime-dispatch patch was synced to the server and applied to the
+already-fetched FlashMLA source:
+
+```text
+.deps/flashmla-src/csrc/api/common.h
+bool is_sm100f() const {
+    return major == 10 || major == 12;
+}
+```
+
+The editable rebuild was restarted on the server with:
+
+```bash
+cd /home/ross/DS/Lvllm
+source /home/ross/miniconda3/etc/profile.d/conda.sh
+conda activate DS
+export CUDA_HOME=/usr/local/cuda-12.9
+export CUDACXX=/usr/local/cuda-12.9/bin/nvcc
+export PATH=/usr/local/cuda-12.9/bin:$PATH
+export MAX_JOBS=24
+/home/ross/.local/bin/uv pip install -e . --torch-backend=auto --no-build-isolation -v
+```
+
+As of 2026-04-28 20:25 HKT, the remote build was still active:
+
+```text
+uv pip install PID 63436
+cmake --build PID 64120
+ninja PID 64121
+build tree /tmp/tmpaycba69p.build-temp
+```
+
+See `continue.md` for the exact sparse FlashMLA smoke test to run after this
+build exits.
+
+## 2026-04-28 Local Follow-Up: Profiling InputBatch Reinit With Offload
+
+After the MLA dimension compatibility patch was synced, startup progressed past
+metadata-builder construction and failed during minimal KV-cache CUDA graph
+profiling:
+
+```text
+AssertionError: Cannot re-initialize the input batch when CPU weight offloading is enabled.
+```
+
+The temporary profiling KV cache now has the real DeepSeek V4 heterogeneous
+block layout, which differs from the pre-load placeholder input batch. The
+regular runtime path still should not rebuild the input batch after CPU offload,
+but the profiling path needs matching block tables before graph warmup/capture.
+
+Local patch applied:
+
+- `vllm/v1/worker/gpu_model_runner.py`
+  - `may_reinitialize_input_batch()` now accepts `is_profiling`.
+  - The CPU-offload reinit guard is relaxed only for profiling initialization.
+  - `initialize_kv_cache()` forwards its existing `is_profiling` flag.
+
+Verification run locally:
+
+```bash
+.venv/bin/python -m py_compile \
+  vllm/v1/worker/gpu_model_runner.py
+```
+
+This command passed.

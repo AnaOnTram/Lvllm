@@ -30,6 +30,17 @@ endif()
 FetchContent_MakeAvailable(flashmla)
 message(STATUS "FlashMLA is available at ${flashmla_SOURCE_DIR}")
 
+# The upstream FlashMLA runtime dispatcher names the Blackwell sparse decode
+# path `sm100f`, but only accepts CUDA device major 10. GeForce Blackwell
+# devices report major 12 while using the same compiled sparse decode sources.
+file(READ "${flashmla_SOURCE_DIR}/csrc/api/common.h" FLASHMLA_COMMON_CONTENT)
+string(REPLACE "return major == 10;"
+               "return major == 10 || major == 12;"
+               FLASHMLA_COMMON_CONTENT
+               "${FLASHMLA_COMMON_CONTENT}")
+file(WRITE "${flashmla_SOURCE_DIR}/csrc/api/common.h"
+     "${FLASHMLA_COMMON_CONTENT}")
+
 # Vendor FlashMLA interface into vLLM with torch-ops shim.
 set(FLASHMLA_VENDOR_DIR "${CMAKE_SOURCE_DIR}/vllm/third_party/flashmla")
 file(MAKE_DIRECTORY "${FLASHMLA_VENDOR_DIR}")
@@ -48,9 +59,8 @@ install(FILES "${FLASHMLA_VENDOR_DIR}/flash_mla_interface.py"
         DESTINATION vllm/third_party/flashmla/
         COMPONENT _flashmla_C)
 
-# The FlashMLA kernels only work on hopper and require CUDA 12.3 or later.
-# Only build FlashMLA kernels if we are building for something compatible with 
-# sm90a
+# The FlashMLA kernels require CUDA 12.3 or later. Build only for
+# architectures that have matching FlashMLA source instantiations.
 
 set(SUPPORT_ARCHS)
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
@@ -62,6 +72,11 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
     list(APPEND SUPPORT_ARCHS "10.0f")
 elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
     list(APPEND SUPPORT_ARCHS "10.0a")
+endif()
+if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+    list(APPEND SUPPORT_ARCHS "12.0f")
+elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
+    list(APPEND SUPPORT_ARCHS "12.0a" "12.1a")
 endif()
 
 
@@ -183,4 +198,3 @@ else()
     add_custom_target(_flashmla_C)
     add_custom_target(_flashmla_extension_C)
 endif()
-
