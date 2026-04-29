@@ -42,6 +42,9 @@ from vllm.v1.attention.ops.flashmla import (
     flash_mla_with_kvcache,
     get_mla_metadata,
 )
+from vllm.v1.attention.ops.deepseek_v4_ops.cache_utils import (
+    compute_global_topk_indices_and_lens,
+)
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -175,6 +178,11 @@ class FlashMLASparseMetadata(AttentionMetadata):
     req_id_per_token: torch.Tensor
     block_size: int = 64
     topk_tokens: int = 2048
+
+    # Pre-computed C128A metadata (DeepseekV4 only, compress_ratio == 128).
+    c128a_global_decode_topk_indices: torch.Tensor | None = None
+    c128a_decode_topk_lens: torch.Tensor | None = None
+    c128a_prefill_topk_indices: torch.Tensor | None = None
 
     @dataclass
     class FP8KernelMetadata:
@@ -326,6 +334,22 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             dtype=torch.int32,
             device=device,
         )
+        compress_ratios = (
+            getattr(self.model_config.hf_config, "compress_ratios", None) or []
+        )
+        self.has_c128a_sparse = any(int(ratio) == 128 for ratio in compress_ratios)
+        if self.has_c128a_sparse:
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            self.c128a_compress_ratio = 128
+            self.c128a_positions_buffer = torch.empty(
+                (max_tokens,), dtype=torch.int64, device=device
+            )
+            self.c128a_topk_offsets = torch.arange(
+                self.topk_tokens, dtype=torch.int64, device=device
+            )
+            self.c128a_topk_indices_buffer = torch.empty(
+                (max_tokens, self.topk_tokens), dtype=torch.int32, device=device
+            )
 
     def _build_fp8_mixed_decode_prefill(
         self,
@@ -506,6 +530,98 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
 
         return fp8_metadata
 
+    def _build_c128a_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        req_id_per_token: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """Build sparse top-k metadata for DeepSeek-V4 C128A layers.
+
+        C128A does not have an indexer, so its sparse indices are deterministic:
+        the valid compressed indices for a token at sequence position p are
+        min((p + 1) // 128, topk_tokens) most-recent compressed slots.
+        """
+        if not self.has_c128a_sparse:
+            return None, None, None
+
+        cm = common_attn_metadata
+        num_tokens = cm.num_actual_tokens
+        if num_tokens == 0:
+            return None, None, None
+
+        (
+            num_decodes,
+            _num_prefills,
+            num_decode_tokens,
+            num_prefill_tokens,
+        ) = split_decodes_and_prefills(
+            cm,
+            decode_threshold=self.reorder_batch_threshold or 1,
+            require_uniform=True,
+        )
+
+        query_start_loc_cpu = cm.query_start_loc_cpu
+        seq_lens_cpu = cm.seq_lens.cpu()
+        positions_cpu = torch.empty(num_tokens, dtype=torch.int64)
+        for req_idx in range(cm.num_reqs):
+            query_start = int(query_start_loc_cpu[req_idx])
+            query_end = int(query_start_loc_cpu[req_idx + 1])
+            query_len = query_end - query_start
+            if query_len == 0:
+                continue
+            seq_len = int(seq_lens_cpu[req_idx])
+            position_start = seq_len - query_len
+            positions_cpu[query_start:query_end] = torch.arange(
+                position_start, seq_len, dtype=torch.int64
+            )
+
+        positions = self.c128a_positions_buffer[:num_tokens]
+        positions.copy_(positions_cpu, non_blocking=True)
+
+        compressed_lens = torch.div(
+            positions + 1, self.c128a_compress_ratio, rounding_mode="floor"
+        )
+        topk_lens = torch.minimum(
+            compressed_lens, torch.full_like(compressed_lens, self.topk_tokens)
+        )
+        topk_starts = torch.clamp(compressed_lens - self.topk_tokens, min=0)
+
+        topk_offsets = self.c128a_topk_offsets[: self.topk_tokens]
+        local_topk_indices = self.c128a_topk_indices_buffer[:num_tokens]
+        local_topk_indices.copy_(
+            (topk_starts[:, None] + topk_offsets[None, :]).to(torch.int32)
+        )
+        local_topk_indices.masked_fill_(
+            topk_offsets[None, :] >= topk_lens[:, None], -1
+        )
+
+        global_decode_topk_indices = None
+        decode_topk_lens = None
+        if num_decode_tokens > 0:
+            c128a_block_size = (
+                self.kv_cache_spec.block_size // self.c128a_compress_ratio
+            )
+            global_decode_topk_indices, decode_topk_lens = (
+                compute_global_topk_indices_and_lens(
+                    local_topk_indices[:num_decode_tokens],
+                    req_id_per_token[:num_decode_tokens],
+                    cm.block_table_tensor[:num_decodes],
+                    c128a_block_size,
+                    cm.slot_mapping[:num_decode_tokens] >= 0,
+                )
+            )
+            global_decode_topk_indices = global_decode_topk_indices.view(
+                num_decode_tokens, 1, self.topk_tokens
+            )
+
+        prefill_topk_indices = None
+        if num_prefill_tokens > 0:
+            prefill_topk_indices = local_topk_indices[
+                num_decode_tokens : num_decode_tokens + num_prefill_tokens
+            ]
+
+        return global_decode_topk_indices, decode_topk_lens, prefill_topk_indices
+
     def build(
         self,
         common_prefix_len: int,
@@ -538,6 +654,12 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             else:
                 fp8_extra_metadata = self._build_fp8_separate_prefill_decode(cm)
 
+        (
+            c128a_global_decode_topk_indices,
+            c128a_decode_topk_lens,
+            c128a_prefill_topk_indices,
+        ) = self._build_c128a_metadata(cm, req_id_per_token)
+
         metadata = FlashMLASparseMetadata(
             num_reqs=cm.num_reqs,
             max_query_len=cm.max_query_len,
@@ -549,6 +671,9 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
             req_id_per_token=req_id_per_token,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
+            c128a_global_decode_topk_indices=c128a_global_decode_topk_indices,
+            c128a_decode_topk_lens=c128a_decode_topk_lens,
+            c128a_prefill_topk_indices=c128a_prefill_topk_indices,
             fp8_extra_metadata=fp8_extra_metadata,
             fp8_use_mixed_batch=fp8_use_mixed_batch,
         )

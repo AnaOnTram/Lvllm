@@ -43,6 +43,69 @@ def _weighted_indexer_logits(
     return (logits * weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)
 
 
+def _gather_indexer_k_quant_cache_torch(
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    head_dim: int,
+    total_seq_lens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_reqs = int(seq_lens.shape[0])
+    cache_block_size = int(kv_cache.shape[1])
+    scale_bytes_per_token = int(kv_cache.shape[2]) - head_dim
+    assert scale_bytes_per_token > 0
+
+    device = seq_lens.device
+    seq_lens_long = seq_lens.to(torch.long)
+    req_ids = torch.repeat_interleave(
+        torch.arange(num_reqs, device=device, dtype=torch.long),
+        seq_lens_long,
+        output_size=total_seq_lens,
+    )
+    token_offsets = torch.arange(
+        total_seq_lens,
+        device=device,
+        dtype=torch.long,
+    )
+    req_starts = torch.cumsum(seq_lens_long, dim=0) - seq_lens_long
+    token_offsets -= req_starts[req_ids]
+
+    block_offsets = torch.div(
+        token_offsets,
+        cache_block_size,
+        rounding_mode="floor",
+    )
+    valid = block_offsets < block_table.shape[1]
+    safe_block_offsets = block_offsets.clamp(max=block_table.shape[1] - 1)
+    block_nums = block_table[req_ids, safe_block_offsets].to(torch.long)
+    valid &= (block_nums >= 0) & (block_nums < kv_cache.shape[0])
+    safe_block_nums = block_nums.clamp(min=0, max=kv_cache.shape[0] - 1)
+
+    page_view = torch.as_strided(
+        kv_cache if kv_cache.dtype == torch.uint8 else kv_cache.view(torch.uint8),
+        size=(kv_cache.shape[0], kv_cache.stride(0)),
+        stride=(kv_cache.stride(0), 1),
+    )
+    token_in_block = token_offsets % cache_block_size
+    k_offsets = (
+        token_in_block[:, None] * head_dim
+        + torch.arange(head_dim, device=device, dtype=torch.long)
+    )
+    scale_offsets = (
+        cache_block_size * head_dim
+        + token_in_block[:, None] * scale_bytes_per_token
+        + torch.arange(scale_bytes_per_token, device=device, dtype=torch.long)
+    )
+
+    k_bytes = page_view[safe_block_nums[:, None], k_offsets]
+    scale_bytes = page_view[safe_block_nums[:, None], scale_offsets]
+    invalid = ~valid
+    k_bytes = k_bytes.masked_fill(invalid[:, None], 0)
+    scale_bytes = scale_bytes.masked_fill(invalid[:, None], 0)
+
+    return k_bytes.contiguous().view(torch.float8_e4m3fn), scale_bytes.contiguous()
+
+
 def _topk_per_row_prefill_fallback(
     logits: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -79,41 +142,31 @@ def _topk_per_row_decode_fallback(
     topk_tokens: int,
 ) -> None:
     seq_lens = decode_metadata.seq_lens
-    decode_lens = decode_metadata.decode_lens
-    num_reqs = int(seq_lens.shape[0])
-    total_seq_lens = int(seq_lens.sum().item())
+    seq_lens_cpu = decode_metadata.seq_lens_cpu
+    decode_lens_cpu = decode_metadata.decode_lens_cpu
+    num_reqs = len(seq_lens_cpu)
+    total_seq_lens = decode_metadata.total_seq_lens
+    num_decode_tokens = decode_metadata.num_decode_tokens
 
     if total_seq_lens == 0:
-        topk_indices_buffer[: int(decode_lens.sum().item())].fill_(-1)
+        topk_indices_buffer[:num_decode_tokens].fill_(-1)
         return
 
-    workspace_manager = current_workspace_manager()
-    k_fp8_full, k_scale_full = workspace_manager.get_simultaneous(
-        ((total_seq_lens, head_dim), torch.float8_e4m3fn),
-        ((total_seq_lens, 4), torch.uint8),
-    )
-
-    cu_seq_lens = torch.zeros(
-        num_reqs + 1,
-        dtype=torch.int32,
-        device=seq_lens.device,
-    )
-    cu_seq_lens[1:] = torch.cumsum(seq_lens, dim=0)
-    ops.cp_gather_indexer_k_quant_cache(
+    k_fp8_full, k_scale_full = _gather_indexer_k_quant_cache_torch(
         kv_cache,
-        k_fp8_full,
-        k_scale_full,
         decode_metadata.block_table,
-        cu_seq_lens,
+        seq_lens,
+        head_dim,
+        total_seq_lens,
     )
     k_dequant_full = _dequantize_indexer_k(k_fp8_full, k_scale_full)
 
-    topk_indices_buffer[: int(decode_lens.sum().item())].fill_(-1)
+    topk_indices_buffer[:num_decode_tokens].fill_(-1)
     query_start = 0
     kv_start = 0
     for req_idx in range(num_reqs):
-        seq_len = int(seq_lens[req_idx].item())
-        decode_len = int(decode_lens[req_idx].item())
+        seq_len = seq_lens_cpu[req_idx]
+        decode_len = decode_lens_cpu[req_idx]
         req_k = k_dequant_full[kv_start : kv_start + seq_len]
         kv_start += seq_len
 

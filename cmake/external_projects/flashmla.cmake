@@ -36,8 +36,8 @@ message(STATUS "FlashMLA is available at ${flashmla_SOURCE_DIR}")
 # SM90 kernels run correctly on SM120 via PTX forward compatibility and use
 # cluster configs that SM120 supports.  Route SM120 to the SM90 kernel path.
 file(READ "${flashmla_SOURCE_DIR}/csrc/api/common.h" FLASHMLA_COMMON_CONTENT)
-string(REPLACE "return major == 9;"
-               "return major == 9 || major == 12;"
+string(REPLACE "return major == 9 && minor == 0;"
+               "return (major == 9 && minor == 0) || major == 12;"
                FLASHMLA_COMMON_CONTENT
                "${FLASHMLA_COMMON_CONTENT}")
 file(WRITE "${flashmla_SOURCE_DIR}/csrc/api/common.h"

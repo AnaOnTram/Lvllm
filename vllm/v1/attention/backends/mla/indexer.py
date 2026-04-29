@@ -153,6 +153,10 @@ class DeepSeekV32IndexerDecodeMetadata:
     block_table: torch.Tensor
     seq_lens: torch.Tensor
     decode_lens: torch.Tensor
+    seq_lens_cpu: tuple[int, ...]
+    decode_lens_cpu: tuple[int, ...]
+    total_seq_lens: int
+    num_decode_tokens: int
     requires_padding: bool
     schedule_metadata: torch.Tensor
     use_large_context_topk: bool
@@ -448,6 +452,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if use_native and next_n > 1:
                 offsets = self.offsets_buffer
                 batch_size = num_decodes
+                seq_lens_cpu_for_fallback = tuple(
+                    int(x) for x in common_attn_metadata.seq_lens_cpu[:num_decodes]
+                )
+                decode_lens_cpu_for_fallback = tuple(int(x) for x in decode_lens_cpu)
             elif max_decode_len > 1:
                 # Flatten multi-token decode requests into single-token
                 # batch entries, expanding seq_lens and block tables so
@@ -505,11 +513,20 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # All reqs now have decode_len=1
                 self.decode_lens_buffer[:num_decode_tokens] = 1
                 decode_lens = self.decode_lens_buffer[:num_decode_tokens]
+                seq_lens_cpu_for_fallback = tuple(
+                    int(x)
+                    for x in self.expanded_seq_lens_buffer[:num_decode_tokens].cpu()
+                )
+                decode_lens_cpu_for_fallback = (1,) * num_decode_tokens
                 offsets = None
                 batch_size = num_decode_tokens
             else:
                 offsets = None
                 batch_size = num_decodes
+                seq_lens_cpu_for_fallback = tuple(
+                    int(x) for x in common_attn_metadata.seq_lens_cpu[:num_decodes]
+                )
+                decode_lens_cpu_for_fallback = tuple(int(x) for x in decode_lens_cpu)
 
             # DeepGEMM is required for the paged MQA logits on CUDA devices
             if current_platform.is_cuda() and has_deep_gemm():
@@ -530,6 +547,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 block_table=block_table,
                 seq_lens=seq_lens,
                 decode_lens=decode_lens,
+                seq_lens_cpu=seq_lens_cpu_for_fallback,
+                decode_lens_cpu=decode_lens_cpu_for_fallback,
+                total_seq_lens=sum(seq_lens_cpu_for_fallback),
+                num_decode_tokens=sum(decode_lens_cpu_for_fallback),
                 requires_padding=False,
                 schedule_metadata=self.scheduler_metadata_buffer,
                 use_large_context_topk=use_large_context_topk,

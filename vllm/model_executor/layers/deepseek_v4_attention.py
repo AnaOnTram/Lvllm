@@ -52,12 +52,16 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
     get_and_maybe_dequant_weights,
 )
+from vllm.platforms import current_platform
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
     DeepseekV4FlashMLASparseBackend,
     FlashMLASparseBackend,
     FlashMLASparseMetadata,
+)
+from vllm.v1.attention.backends.mla.triton_mla_sparse import (
+    TritonMLASparseBackend,
 )
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV4IndexerBackend,
@@ -67,6 +71,10 @@ from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 from vllm.v1.attention.ops.flashmla import (
     flash_mla_sparse_fwd,
     flash_mla_with_kvcache,
+)
+from vllm.v1.attention.ops.triton_mla_sparse import (
+    triton_deepseek_v4_sparse_decode,
+    triton_sparse_bf16_attention,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.worker.workspace import current_workspace_manager
@@ -647,18 +655,19 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.max_model_len = vllm_config.model_config.max_model_len
         # DeepseekV4 only supports fp8 kv-cache format for now
         kv_cache_dtype = cache_config.cache_dtype if cache_config is not None else "fp8"
+        attn_backend = self.get_attn_backend()
 
         assert kv_cache_dtype.startswith("fp8"), (
             f"DeepseekV4 only supports fp8 kv-cache format for now, "
             f"got {kv_cache_dtype}"
         )
-        assert issubclass(self.get_attn_backend(), FlashMLASparseBackend), (
-            "Only FlashMLA Sparse Attention backend is supported for DeepseekV4 for now"
+        assert attn_backend.is_mla() and attn_backend.is_sparse(), (
+            "Only sparse MLA attention backends are supported for DeepseekV4 for now"
         )
         # FlashMLA Sparse Attention fp8 backend uses "fp8_ds_mla" kv-cache format
         # Automatically convert fp8 kv-cache format to "fp8_ds_mla"
         if (
-            issubclass(self.get_attn_backend(), FlashMLASparseBackend)
+            issubclass(attn_backend, (FlashMLASparseBackend, TritonMLASparseBackend))
             and kv_cache_dtype.startswith("fp8")
             and kv_cache_dtype != "fp8_ds_mla"
         ):
@@ -672,6 +681,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
 
         self.kv_cache_dtype = kv_cache_dtype
+        self.attn_backend = attn_backend
+        self.use_triton_sparse = issubclass(attn_backend, TritonMLASparseBackend)
 
         # Register with compilation context for metadata lookup
         compilation_config = vllm_config.compilation_config
@@ -683,6 +694,9 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         self.kv_cache = torch.tensor([])
 
     def get_attn_backend(self) -> type[AttentionBackend]:
+        capability = current_platform.get_device_capability()
+        if capability is not None and capability.major == 12:
+            return TritonMLASparseBackend
         return DeepseekV4FlashMLASparseBackend
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
@@ -797,8 +811,24 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
 
         # Prepare SWA cache (num_blocks, swa_block_size, 1, head_bytes)
         # Use unsqueeze to preserve strides (handles padded blocks correctly)
-        swa_cache = self.swa_cache_layer.kv_cache.unsqueeze(-2)
+        swa_cache = self.swa_cache_layer.kv_cache
         # Reshape KV cache to (num_blocks, block_size, 1, head_bytes)
+        if self.use_triton_sparse:
+            triton_deepseek_v4_sparse_decode(
+                q=q,
+                swa_cache=swa_cache,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                attn_sink=self.attn_sink,
+                sm_scale=self.scale,
+                out=output,
+                extra_cache=kv_cache if not swa_only else None,
+                extra_indices=topk_indices if not swa_only else None,
+                extra_lens=topk_lens if not swa_only else None,
+            )
+            return
+
+        swa_cache = swa_cache.unsqueeze(-2)
         if kv_cache is not None:
             kv_cache = kv_cache.unsqueeze(-2)
 
@@ -950,15 +980,26 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 N,
             )
 
-            output_chunk, _, _ = flash_mla_sparse_fwd(
-                q=q[query_start:query_end],
-                kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices.unsqueeze(1),
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
-                topk_length=combined_lens,
-                out=output[query_start:query_end],
-            )
+            if self.use_triton_sparse:
+                triton_sparse_bf16_attention(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices,
+                    topk_length=combined_lens,
+                    attn_sink=self.attn_sink,
+                    sm_scale=self.scale,
+                    out=output[query_start:query_end],
+                )
+            else:
+                flash_mla_sparse_fwd(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=combined_lens,
+                    out=output[query_start:query_end],
+                )
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):

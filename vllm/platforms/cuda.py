@@ -84,6 +84,25 @@ def _get_backend_priorities(
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
     if use_mla:
+        if device_capability.major == 12:
+            if kv_cache_dtype is not None and is_quantized_kv_cache(kv_cache_dtype):
+                sparse_backends = [
+                    AttentionBackendEnum.TRITON_MLA_SPARSE,
+                    AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
+                ]
+            else:
+                sparse_backends = [
+                    AttentionBackendEnum.TRITON_MLA,
+                    AttentionBackendEnum.FLASHINFER_MLA_SPARSE,
+                ]
+            return [
+                AttentionBackendEnum.FLASHINFER_MLA,
+                AttentionBackendEnum.CUTLASS_MLA,
+                AttentionBackendEnum.FLASH_ATTN_MLA,
+                AttentionBackendEnum.FLASHMLA,
+                AttentionBackendEnum.TRITON_MLA,
+                *sparse_backends,
+            ]
         if device_capability.major in (10, 12):
             # Sparse MLA backend priorities
             # See https://github.com/vllm-project/vllm/issues/35807 for
