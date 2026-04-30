@@ -49,14 +49,21 @@ def _gather_indexer_k_quant_cache_torch(
     seq_lens: torch.Tensor,
     head_dim: int,
     total_seq_lens: int,
+    seq_lens_cpu: tuple[int, ...] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    num_reqs = int(seq_lens.shape[0])
+    num_reqs = (
+        len(seq_lens_cpu) if seq_lens_cpu is not None else int(seq_lens.shape[0])
+    )
     cache_block_size = int(kv_cache.shape[1])
     scale_bytes_per_token = int(kv_cache.shape[2]) - head_dim
     assert scale_bytes_per_token > 0
 
     device = seq_lens.device
-    seq_lens_long = seq_lens.to(torch.long)
+    if seq_lens_cpu is not None:
+        total_seq_lens = sum(seq_lens_cpu)
+        seq_lens_long = torch.tensor(seq_lens_cpu, device=device, dtype=torch.long)
+    else:
+        seq_lens_long = seq_lens.to(torch.long)
     req_ids = torch.repeat_interleave(
         torch.arange(num_reqs, device=device, dtype=torch.long),
         seq_lens_long,
@@ -145,8 +152,8 @@ def _topk_per_row_decode_fallback(
     seq_lens_cpu = decode_metadata.seq_lens_cpu
     decode_lens_cpu = decode_metadata.decode_lens_cpu
     num_reqs = len(seq_lens_cpu)
-    total_seq_lens = decode_metadata.total_seq_lens
-    num_decode_tokens = decode_metadata.num_decode_tokens
+    total_seq_lens = sum(seq_lens_cpu)
+    num_decode_tokens = sum(decode_lens_cpu)
 
     if total_seq_lens == 0:
         topk_indices_buffer[:num_decode_tokens].fill_(-1)
@@ -158,6 +165,7 @@ def _topk_per_row_decode_fallback(
         seq_lens,
         head_dim,
         total_seq_lens,
+        seq_lens_cpu,
     )
     k_dequant_full = _dequantize_indexer_k(k_fp8_full, k_scale_full)
 

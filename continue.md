@@ -238,6 +238,70 @@ Remote runtime progress after syncing Option A:
   `/home/ross/DS/Lvllm/vllm/v1/attention/ops/triton_mla_sparse.py`.
   Local and remote SHA256 both equal
   `9dc22306b053c05fef7d5c697fb31b1b7e0cf2e184d7c4f89802a618f18b2334`.
+
+2026-04-29 4096-token runtime request failure:
+
+- User ran:
+
+```bash
+LVLLM_MOE_NUMA_ENABLED=1 LK_THREAD_BINDING=CPU_CORE LK_THREADS=20 \
+  OMP_NUM_THREADS=20 vllm serve deepseek-ai/DeepSeek-V4-Flash \
+  --config deepseek_v4.yaml --cpu-offload-gb 142 \
+  --gpu-memory-utilization 0.95 --max-model-len 4096 \
+  --max-num-batched-tokens 4096
+```
+
+- Server initialized successfully, but the first chat request crashed with:
+
+```text
+repeat_interleave output_size argument (1) must be the same as the sum of the
+elements in the repeats tensor (18)
+```
+
+- Scheduler dump showed one cached request with `num_computed_tokens=[18]` and
+  one scheduled decode token. The sparse-indexer fallback was mixing scheduled
+  decode-token count with total cached context-token count.
+- Local patches applied:
+  - `vllm/model_executor/layers/sparse_attn_indexer.py`
+    - `_topk_per_row_decode_fallback()` now derives total cached length and
+      decode-token count from `seq_lens_cpu` / `decode_lens_cpu`.
+    - `_gather_indexer_k_quant_cache_torch()` accepts `seq_lens_cpu` and keeps
+      `repeat_interleave(output_size=...)` aligned with the repeat sum.
+    - Follow-up capture fix: the fallback no longer constructs
+      `torch.tensor(seq_lens_cpu, device=...)` during CUDA graph capture; it
+      reuses the existing GPU `seq_lens` tensor and only uses CPU metadata for
+      Python scalar totals.
+  - `vllm/v1/attention/backends/mla/indexer.py`
+    - Multi-token decode flattening now builds `decode_lens_for_expand` from
+      the CPU lengths before `repeat_interleave`, avoiding CPU/GPU metadata
+      mismatch.
+  - `vllm/v1/attention/backends/mla/flashmla_sparse.py`
+    - C128A metadata now uses `cm.seq_lens_cpu` instead of synchronizing
+      `cm.seq_lens.cpu()` in the sparse metadata builder.
+- Local verification:
+
+```bash
+.venv/bin/python -m py_compile \
+  vllm/model_executor/layers/sparse_attn_indexer.py \
+  vllm/v1/attention/backends/mla/indexer.py \
+  vllm/v1/attention/backends/mla/flashmla_sparse.py
+
+git diff --check -- \
+  vllm/model_executor/layers/sparse_attn_indexer.py \
+  vllm/v1/attention/backends/mla/indexer.py \
+  vllm/v1/attention/backends/mla/flashmla_sparse.py
+```
+
+- First remote rerun after the repeat-size patch moved past the original
+  `Repeat.cu` assertion and exposed the CUDA graph capture allocation issue:
+
+```text
+torch.AcceleratorError: CUDA error: operation not permitted when stream is capturing
+```
+
+- The local follow-up patch addresses that capture issue, but remote sync and
+  rerun were not completed after context compaction because the SSH credential
+  was no longer available to the agent.
 - Remote `.venv/bin/python` does not exist, so remote `py_compile` was not run.
   Local `py_compile` and `git diff --check` passed for the synced kernel file.
 

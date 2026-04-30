@@ -279,6 +279,8 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
+        if current_platform.is_cuda() and not has_deep_gemm():
+            return AttentionCGSupport.NEVER
         return AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, *args, **kwargs):
@@ -444,6 +446,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             seq_lens = common_attn_metadata.seq_lens[:num_decodes]
             block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
+            seq_lens_cpu_decode = torch.maximum(
+                common_attn_metadata.seq_lens_cpu[:num_decodes],
+                common_attn_metadata.num_computed_tokens_cpu[:num_decodes]
+                + decode_lens_cpu,
+            )
 
             max_decode_len = int(decode_lens_cpu.max().item())
             next_n = 1 + self.num_speculative_tokens
@@ -453,7 +460,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 offsets = self.offsets_buffer
                 batch_size = num_decodes
                 seq_lens_cpu_for_fallback = tuple(
-                    int(x) for x in common_attn_metadata.seq_lens_cpu[:num_decodes]
+                    int(x) for x in seq_lens_cpu_decode
                 )
                 decode_lens_cpu_for_fallback = tuple(int(x) for x in decode_lens_cpu)
             elif max_decode_len > 1:
@@ -472,16 +479,21 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
                 # 3 + 1 + 4 + 0 = 8
                 actual_expanded = int(decode_lens_cpu.sum().item())
+                decode_lens_for_expand = decode_lens_cpu.to(
+                    device=self.device, non_blocking=True
+                )
 
                 # [7, 6, 8, 0] -> [7, 7, 7, 6, 8, 8, 8, 8]
                 expanded_base = torch.repeat_interleave(
-                    seq_lens - decode_lens, decode_lens, output_size=actual_expanded
+                    seq_lens - decode_lens_for_expand,
+                    decode_lens_for_expand,
+                    output_size=actual_expanded,
                 )
 
                 # [0, 3, 4, 8] -> [0, 0, 0, 3, 4, 4, 4, 4]
                 expanded_starts = torch.repeat_interleave(
                     common_attn_metadata.query_start_loc[:num_decodes],
-                    decode_lens,
+                    decode_lens_for_expand,
                     output_size=actual_expanded,
                 )
 
@@ -501,7 +513,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # original request.
                 self.expanded_block_table_buffer[:actual_expanded] = (
                     torch.repeat_interleave(
-                        block_table, decode_lens, dim=0, output_size=actual_expanded
+                        block_table,
+                        decode_lens_for_expand,
+                        dim=0,
+                        output_size=actual_expanded,
                     )
                 )
                 if actual_expanded < num_decode_tokens:
@@ -514,8 +529,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 self.decode_lens_buffer[:num_decode_tokens] = 1
                 decode_lens = self.decode_lens_buffer[:num_decode_tokens]
                 seq_lens_cpu_for_fallback = tuple(
-                    int(x)
-                    for x in self.expanded_seq_lens_buffer[:num_decode_tokens].cpu()
+                    int(seq_len - decode_len + pos + 1)
+                    for seq_len, decode_len in zip(
+                        seq_lens_cpu_decode, decode_lens_cpu
+                    )
+                    for pos in range(int(decode_len))
                 )
                 decode_lens_cpu_for_fallback = (1,) * num_decode_tokens
                 offsets = None
@@ -524,7 +542,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 offsets = None
                 batch_size = num_decodes
                 seq_lens_cpu_for_fallback = tuple(
-                    int(x) for x in common_attn_metadata.seq_lens_cpu[:num_decodes]
+                    int(x) for x in seq_lens_cpu_decode
                 )
                 decode_lens_cpu_for_fallback = tuple(int(x) for x in decode_lens_cpu)
 

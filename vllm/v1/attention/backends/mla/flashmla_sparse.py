@@ -561,7 +561,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         )
 
         query_start_loc_cpu = cm.query_start_loc_cpu
-        seq_lens_cpu = cm.seq_lens.cpu()
+        seq_lens_cpu = cm.seq_lens_cpu
         positions_cpu = torch.empty(num_tokens, dtype=torch.int64)
         for req_idx in range(cm.num_reqs):
             query_start = int(query_start_loc_cpu[req_idx])
